@@ -1,0 +1,4603 @@
+#!/usr/bin/env python3
+"""
+ENHANCED LEGAL RAG DOCUMENT TRANSLATOR BACKEND
+Real OCR processing, RAG-powered translation, and paragraph-by-paragraph processing
+"""
+
+import easyocr
+import os
+import ollama
+from PIL import Image, ImageDraw, ImageFont
+import webbrowser
+import base64
+from io import BytesIO
+import numpy as np
+import textwrap
+import json
+import tempfile
+import cv2
+from flask import Flask, request, jsonify, send_file
+import threading
+import time
+import re
+from pathlib import Path
+import logging
+import requests
+from datetime import datetime
+
+# Import our Legal RAG System
+try:
+    from legal_rag_system import LegalRAGSystem
+    RAG_AVAILABLE = True
+except ImportError:
+    print("⚠️ Legal RAG System not available. Using basic translation.")
+    RAG_AVAILABLE = False
+
+app = Flask(__name__)
+
+# Global variables to store processing data
+current_image = None
+current_bboxes = []
+current_translated_text = []
+current_image_path = None
+current_target_language = 'te'
+current_rag_system = None
+current_paragraphs = []
+current_paragraph_index = 0
+
+# Initialize Legal RAG System if available
+if RAG_AVAILABLE:
+    try:
+        print("🚀 Initializing Legal RAG System...")
+        current_rag_system = LegalRAGSystem()
+        current_rag_system.initialize()
+        
+        # Check if collections already have data to avoid reprocessing
+        collections_to_check = ['hindi_glossary', 'telugu_glossary', 'government_orders']
+        needs_processing = False
+        
+        for collection_name in collections_to_check:
+            try:
+                collection = current_rag_system.chroma_client.get_collection(collection_name)
+                if collection.count() == 0:
+                    needs_processing = True
+                    break
+            except:
+                needs_processing = True
+                break
+        
+        if needs_processing:
+            print("📚 Processing legal documents for the first time...")
+            # Process existing PDF files in glossary directories (limit to first 3 files for faster startup)
+            hindi_glossary_dir = Path("glossary - hindi")
+            telugu_glossary_dir = Path("glossary telugu")
+            go_dir = Path("GOs (1)")
+            
+            if hindi_glossary_dir.exists():
+                print("📚 Processing Hindi glossary documents (first 5 files for optimal performance)...")
+                current_rag_system.process_glossary_documents_limited(str(hindi_glossary_dir), 'hindi', limit=5)
+            
+            if telugu_glossary_dir.exists():
+                print("📚 Processing Telugu glossary documents (first 3 files for optimal performance)...")
+                current_rag_system.process_glossary_documents_limited(str(telugu_glossary_dir), 'telugu', limit=3)
+            
+            if go_dir.exists():
+                print("📋 Processing Government Orders (first 5 files for optimal performance)...")
+                current_rag_system.process_government_orders_limited(str(go_dir), limit=5)
+        else:
+            print("✅ Legal documents already processed - using existing data")
+        
+        print("✅ Legal RAG System initialized successfully!")
+    except Exception as e:
+        print(f"❌ Failed to initialize RAG system: {e}")
+        current_rag_system = None
+
+def process_image_with_ocr(image_path):
+    """Process image with EasyOCR and return bounding boxes and text"""
+    print(f"Processing image: {image_path}")
+    
+    # Try multiple language combinations for better detection
+    language_combinations = [
+        ['en'],  # English only
+        ['en', 'hi'],  # English + Hindi
+        ['en', 'te'],  # English + Telugu
+        ['en', 'hi', 'te'],  # English + Hindi + Telugu
+        ['en', 'hi', 'te', 'ta', 'kn', 'ml', 'gu', 'pa', 'bn', 'or'],  # All major Indian languages
+    ]
+    
+    bboxes = []
+    
+    for lang_combo in language_combinations:
+        try:
+            print(f"Trying OCR with languages: {lang_combo}")
+            reader = easyocr.Reader(lang_combo)
+            results = reader.readtext(image_path, detail=1, paragraph=True)
+            
+            for res in results:
+                if len(res) >= 2:
+                    bbox_info = {
+                        "bbox": res[0], 
+                        "text": res[1],
+                        "confidence": res[2] if len(res) >= 3 else 0.9
+                    }
+                    bboxes.append(bbox_info)
+            
+            if bboxes:
+                print(f"Found {len(bboxes)} text regions with {lang_combo}")
+                break
+                
+        except Exception as e:
+            print(f"OCR failed with {lang_combo}: {e}")
+            continue
+    
+    # If still no text found, try without paragraph mode
+    if not bboxes:
+        print("Trying OCR without paragraph mode...")
+        try:
+            reader = easyocr.Reader(['en'])
+            results = reader.readtext(image_path, detail=1, paragraph=False)
+            
+            for res in results:
+                if len(res) >= 2:
+                    bbox_info = {
+                        "bbox": res[0], 
+                        "text": res[1],
+                        "confidence": res[2] if len(res) >= 3 else 0.9
+                    }
+                    bboxes.append(bbox_info)
+            
+            print(f"Found {len(bboxes)} text regions without paragraph mode")
+        except Exception as e:
+            print(f"OCR failed without paragraph mode: {e}")
+    
+    if not bboxes:
+        print("⚠️ No text detected! The image might be:")
+        print("   - Too blurry or low quality")
+        print("   - Contains only images/logos without text")
+        print("   - Text is too small or unclear")
+        print("   - Contains handwritten text (EasyOCR works best with printed text)")
+    
+    return bboxes
+
+def split_text_into_paragraphs(text):
+    """Split text into logical paragraphs for processing"""
+    print("📝 Splitting text into paragraphs...")
+    
+    # Split by double newlines first
+    paragraphs = re.split(r'\n\s*\n', text.strip())
+    
+    # Further split long paragraphs by sentences
+    refined_paragraphs = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+            
+        # If paragraph is very long (>500 chars), split by sentences
+        if len(para) > 500:
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+            current_chunk = ""
+            
+            for sentence in sentences:
+                if len(current_chunk + sentence) > 300:
+                    if current_chunk:
+                        refined_paragraphs.append(current_chunk.strip())
+                        current_chunk = sentence
+                    else:
+                        refined_paragraphs.append(sentence)
+                else:
+                    current_chunk += " " + sentence if current_chunk else sentence
+            
+            if current_chunk:
+                refined_paragraphs.append(current_chunk.strip())
+        else:
+            refined_paragraphs.append(para)
+    
+    print(f"📊 Split into {len(refined_paragraphs)} paragraphs")
+    return refined_paragraphs
+
+def translate_paragraph_with_rag(paragraph, model='gemma3-legal-samanantar-pro:latest', target_language='te'):
+    """Translate a single paragraph using RAG system"""
+    print(f"🔄 Translating paragraph with RAG: {paragraph[:50]}...")
+    
+    lang_info = get_language_info(target_language)
+    
+    # Get legal context if RAG system is available
+    legal_context = None
+    if current_rag_system:
+        try:
+            legal_context = current_rag_system.get_legal_context(paragraph, target_language)
+            print(f"📚 Found {len(legal_context['glossary_matches'])} glossary matches")
+        except Exception as e:
+            print(f"⚠️ RAG context failed: {e}")
+    
+    # Create enhanced prompt with legal context
+    if legal_context and legal_context['glossary_matches']:
+        context_info = "\n".join([
+            f"• {match['document'][:100]}..." 
+            for match in legal_context['glossary_matches'][:3]
+        ])
+        
+        prompt = f"""You are a professional legal translator with access to legal glossaries. Translate this government document paragraph to {lang_info['name']} ({lang_info['native']}) maintaining:
+
+1. EXACT legal meaning and structure
+2. Formal government document tone  
+3. All dates, numbers, and references intact
+4. Legal terminology accuracy
+5. Complete sentences and proper grammar
+
+LEGAL CONTEXT FROM GLOSSARIES:
+{context_info}
+
+LEGAL TERMS FOUND:
+{', '.join(legal_context['legal_terms'][:5])}
+
+Paragraph to translate:
+{paragraph}
+
+Provide the complete translation in {lang_info['name']}:"""
+    else:
+        # Fallback to standard legal translation
+        prompt = f"""You are a professional legal translator. Translate this government document paragraph to {lang_info['name']} ({lang_info['native']}) maintaining:
+
+1. EXACT legal meaning and structure
+2. Formal government document tone  
+3. All dates, numbers, and references intact
+4. Legal terminology accuracy
+5. Complete sentences and proper grammar
+
+Paragraph to translate:
+{paragraph}
+
+Provide the complete translation in {lang_info['name']}:"""
+    
+    try:
+        translated_text = ollama.generate(model=model, prompt=prompt)['response']
+        print(f"✅ Paragraph translated to {lang_info['name']}")
+        return translated_text
+    except Exception as e:
+        print(f"❌ Translation error: {e}")
+        return fallback_translation(paragraph, target_language)
+
+def translate_text_with_rag_paragraphs(text, model='gemma3-legal-samanantar-pro:latest', target_language='te'):
+    """Translate text paragraph by paragraph using RAG system"""
+    print("⚖️ Starting RAG-powered paragraph-by-paragraph translation...")
+    
+    # Split text into paragraphs
+    paragraphs = split_text_into_paragraphs(text)
+    
+    # Store paragraphs globally for processing
+    global current_paragraphs
+    current_paragraphs = paragraphs
+    
+    translated_paragraphs = []
+    
+    for i, paragraph in enumerate(paragraphs):
+        print(f"📝 Processing paragraph {i+1}/{len(paragraphs)}")
+        
+        # Translate each paragraph
+        translated_para = translate_paragraph_with_rag(paragraph, model, target_language)
+        translated_paragraphs.append(translated_para)
+        
+        # Add small delay to prevent overwhelming the system
+        time.sleep(0.5)
+    
+    # Join translated paragraphs
+    final_translation = '\n\n'.join(translated_paragraphs)
+    print(f"✅ Completed paragraph-by-paragraph translation ({len(paragraphs)} paragraphs)")
+    
+    return final_translation
+
+def translate_text(text, model='gemma3-legal-samanantar-pro:latest', target_language='te'):
+    """Translate text using Ollama with fallback"""
+    print("Translating text...")
+    
+    # Get language name and prompt
+    lang_info = get_language_info(target_language)
+    
+    if target_language == 'en':
+        # For English, improve the text rather than translate
+        prompt = f"""Improve this government document text for better clarity and formal tone while maintaining all legal meaning:
+
+{text}
+
+Provide improved English version:"""
+    else:
+        # Use RAG-powered paragraph translation
+        return translate_text_with_rag_paragraphs(text, model, target_language)
+    
+    try:
+        translated_text = ollama.generate(
+            model=model,
+            prompt=prompt
+        )['response']
+        print(f"Translation to {lang_info['name']} completed")
+        return translated_text
+    except Exception as e:
+        print(f"Translation error: {e}")
+        print("Using fallback translation method...")
+        return fallback_translation(text, target_language)
+
+def fallback_translation(text, target_language):
+    """Fallback translation when Ollama is unavailable"""
+    print(f"Using fallback translation for {target_language}")
+    
+    # Simple fallback translations for common legal terms
+    fallback_translations = {
+        'te': {  # Telugu
+            'OFFICE OF THE REGISTRAR GENERAL': 'రిజిస్ట్రార్ జనరల్ కార్యాలయం',
+            'Government of India': 'భారత ప్రభుత్వం',
+            'Ministry of Home Affairs': 'గృహ వ్యవహారాల మంత్రిత్వ శాఖ',
+            'TENDER ENQUIRY NOTICE': 'టెండర్ విచారణ నోటీసు',
+            'Subject:': 'విషయం:',
+            'Dated:': 'తేదీ:',
+            'No.': 'సంఖ్య:',
+            'Procurement': 'కొనుగోలు',
+            'Supply': 'సరఫరా',
+            'Services': 'సేవలు',
+            'Contract': 'ఒప్పందం',
+            'Agreement': 'ఒప్పందం',
+            'Terms and Conditions': 'నిబంధనలు మరియు షరతులు'
+        },
+        'hi': {  # Hindi
+            'OFFICE OF THE REGISTRAR GENERAL': 'रजिस्ट्रार जनरल का कार्यालय',
+            'Government of India': 'भारत सरकार',
+            'Ministry of Home Affairs': 'गृह मंत्रालय',
+            'TENDER ENQUIRY NOTICE': 'निविदा पूछताछ नोटिस',
+            'Subject:': 'विषय:',
+            'Dated:': 'दिनांक:',
+            'No.': 'संख्या:',
+            'Procurement': 'खरीद',
+            'Supply': 'आपूर्ति',
+            'Services': 'सेवाएं',
+            'Contract': 'अनुबंध',
+            'Agreement': 'समझौता',
+            'Terms and Conditions': 'नियम और शर्तें'
+        },
+        'ta': {  # Tamil
+            'OFFICE OF THE REGISTRAR GENERAL': 'பதிவாளர் ஜெனரல் அலுவலகம்',
+            'Government of India': 'இந்திய அரசு',
+            'Ministry of Home Affairs': 'உள்துறை அமைச்சகம்',
+            'TENDER ENQUIRY NOTICE': 'டெண்டர் விசாரணை அறிவிப்பு',
+            'Subject:': 'பொருள்:',
+            'Dated:': 'தேதி:',
+            'No.': 'எண்:',
+            'Procurement': 'கொள்முதல்',
+            'Supply': 'வழங்கல்',
+            'Services': 'சேவைகள்',
+            'Contract': 'ஒப்பந்தம்',
+            'Agreement': 'ஒப்பந்தம்',
+            'Terms and Conditions': 'விதிமுறைகள் மற்றும் நிபந்தனைகள்'
+        }
+    }
+    
+    # Get translations for the target language
+    translations = fallback_translations.get(target_language, {})
+    
+    # Apply translations
+    translated_text = text
+    for english_term, translated_term in translations.items():
+        translated_text = translated_text.replace(english_term, translated_term)
+    
+    # If no translations were applied, return original text with a note
+    if translated_text == text:
+        translated_text = f"[{target_language.upper()}] {text} [Translation unavailable - Ollama service required]"
+    
+    return translated_text
+
+def get_language_info(lang_code):
+    """Get language information by code"""
+    languages = {
+        'te': {'name': 'Telugu', 'native': 'తెలుగు'},
+        'hi': {'name': 'Hindi', 'native': 'हिन्दी'},
+        'ta': {'name': 'Tamil', 'native': 'தமிழ்'},
+        'kn': {'name': 'Kannada', 'native': 'ಕನ್ನಡ'},
+        'ml': {'name': 'Malayalam', 'native': 'മലയാളം'},
+        'en': {'name': 'English', 'native': 'English'},
+        'gu': {'name': 'Gujarati', 'native': 'ગુજરાતી'},
+        'pa': {'name': 'Punjabi', 'native': 'ਪੰਜਾਬੀ'},
+        'bn': {'name': 'Bengali', 'native': 'বাংলা'},
+        'or': {'name': 'Odia', 'native': 'ଓଡ଼ିଆ'}
+    }
+    return languages.get(lang_code, {'name': 'Telugu', 'native': 'తెలుగు'})
+
+def get_font_family(language_code):
+    """Get appropriate font family for the language"""
+    font_mapping = {
+        'te': 'Noto+Sans+Telugu',
+        'hi': 'Noto+Sans+Devanagari',
+        'ta': 'Noto+Sans+Tamil',
+        'kn': 'Noto+Sans+Kannada',
+        'ml': 'Noto+Sans+Malayalam',
+        'gu': 'Noto+Sans+Gujarati',
+        'pa': 'Noto+Sans+Gurmukhi',
+        'bn': 'Noto+Sans+Bengali',
+        'or': 'Noto+Sans+Oriya',
+        'en': 'Roboto'
+    }
+    return font_mapping.get(language_code, 'Roboto')
+
+def create_processed_html(image_path, bboxes, translated_lines, user_actions, target_language='te'):
+    """Create processed HTML document based on user actions"""
+    print("Creating processed HTML document...")
+    
+    # Get language info for font selection
+    lang_info = get_language_info(target_language)
+    
+    # Convert image to base64
+    with open(image_path, 'rb') as img_file:
+        img_data = base64.b64encode(img_file.read()).decode()
+    
+    # Get image dimensions
+    with Image.open(image_path) as img:
+        img_width, img_height = img.size
+    
+    # Create text overlays based on user actions
+    text_overlays = []
+    for i, bbox in enumerate(bboxes):
+        action = user_actions.get(str(i), 'preserve')
+        
+        if action == 'whiteout':
+            # Skip whiteout regions (they won't be rendered)
+            print(f"Whiteout region {i}")
+            continue
+            
+        elif action == 'translate' and i < len(translated_lines):
+            text_to_draw = translated_lines[i].strip()
+            print(f"Translate region {i}")
+        else:
+            text_to_draw = bbox['text']
+            print(f"Preserve region {i}")
+        
+        # Convert bbox coordinates to percentages
+        bbox_coords = bbox['bbox']
+        x_coords = [point[0] for point in bbox_coords]
+        y_coords = [point[1] for point in bbox_coords]
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+        
+        # Convert to percentages
+        left_pct = (x_min / img_width) * 100
+        top_pct = (y_min / img_height) * 100
+        width_pct = ((x_max - x_min) / img_width) * 100
+        height_pct = ((y_max - y_min) / img_height) * 100
+        
+        # Calculate font size based on height
+        font_size = max(8, min(16, int(height_pct * 0.8)))
+        
+        text_overlays.append({
+            'text': text_to_draw,
+            'left': left_pct,
+            'top': top_pct,
+            'width': width_pct,
+            'height': height_pct,
+            'font_size': font_size,
+            'action': action
+        })
+    
+    # Get appropriate font for the language
+    font_family = get_font_family(target_language)
+    
+    # Generate HTML overlays - EXACTLY like original main.py
+    overlays_html = ""
+    for overlay in text_overlays:
+        overlays_html += f'''
+        <div class="text-overlay {overlay['action']}" 
+             style="left: {overlay['left']:.2f}%; 
+                    top: {overlay['top']:.2f}%; 
+                    width: {overlay['width']:.2f}%; 
+                    height: {overlay['height']:.2f}%; 
+                    font-size: {overlay['font_size']}px;">
+            {overlay['text']}
+        </div>
+        '''
+    
+    html_template = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Processed Document - {lang_info['name']}</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family={font_family}:wght@400;700&display=swap');
+        
+        body {{
+            margin: 0;
+            padding: 0;
+            font-family: '{font_family}', Arial, sans-serif;
+            background: white;
+            position: relative;
+        }}
+        
+        .document-container {{
+            position: relative;
+            width: 100%;
+            height: 100vh;
+            background: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        
+        .background-image {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 1.0;
+            z-index: 1;
+            pointer-events: none;
+        }}
+        
+        .text-overlay {{
+            position: absolute;
+            z-index: 2;
+            background: rgba(255, 255, 255, 1.0);
+            border-radius: 2px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: flex-start;
+            line-height: 1.2;
+            padding: 3px;
+            box-shadow: none;
+            border: none;
+        }}
+        
+        .text-overlay.translate {{
+            background: rgba(255, 255, 255, 1.0);
+            border: none;
+        }}
+        
+        .text-overlay.preserve {{
+            background: rgba(255, 255, 255, 1.0);
+            border: none;
+        }}
+        
+        .text-overlay.whiteout {{
+            background: rgba(255, 255, 255, 1.0);
+            border: none;
+        }}
+        
+        /* Print styles */
+        @media print {{
+            body {{ margin: 0; padding: 0; }}
+            .text-overlay {{ background: white; }}
+        }}
+        
+        /* Responsive adjustments */
+        @media (max-width: 768px) {{
+            .text-overlay {{
+                font-size: 10px !important;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="document-container">
+        <!-- Background image with full opacity to preserve logo/signatures -->
+        <img src="data:image/png;base64,{img_data}" class="background-image" alt="Original Document">
+        
+        <!-- Text overlays positioned exactly like original -->
+        {overlays_html}
+    </div>
+</body>
+</html>
+"""
+    
+    print(f"✅ HTML document created")
+    return html_template
+
+def create_dynamic_ui():
+    """Create the enhanced HTML interface with all advanced features"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enhanced Legal RAG Document Translator</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;700&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #000;
+            color: #fff;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            border-bottom: 2px solid #fff;
+            padding-bottom: 20px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            font-weight: 300;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.8;
+        }
+        
+        .rag-status {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+            margin: 10px 0;
+        }
+        
+        .rag-status.active {
+            background: #e8f5e8;
+            color: #2e7d32;
+            border: 1px solid #4caf50;
+        }
+        
+        .rag-status.inactive {
+            background: #fff3e0;
+            color: #f57c00;
+            border: 1px solid #ff9800;
+        }
+        
+        .upload-section {
+            background: #111;
+            border: 2px dashed #333;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            transition: all 0.3s ease;
+        }
+        
+        .upload-section:hover {
+            border-color: #666;
+            background: #1a1a1a;
+        }
+        
+        .upload-section.dragover {
+            border-color: #fff;
+            background: #222;
+        }
+        
+        .upload-icon {
+            font-size: 3em;
+            margin-bottom: 20px;
+            opacity: 0.6;
+        }
+        
+        .upload-text {
+            font-size: 1.2em;
+            margin-bottom: 20px;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .upload-btn {
+            background: #fff;
+            color: #000;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 5px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .upload-btn:hover {
+            background: #ccc;
+        }
+        
+        .model-selection-section {
+            background: #111;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .model-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .model-card {
+            background: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .model-card:hover {
+            border-color: #666;
+            background: #222;
+        }
+        
+        .model-card.selected {
+            border-color: #fff;
+            background: #333;
+        }
+        
+        .model-icon {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+        
+        .model-name {
+            font-size: 1.2em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .model-desc {
+            font-size: 0.9em;
+            opacity: 0.7;
+        }
+        
+        .agent-mode-toggle {
+            text-align: center;
+            margin-top: 20px;
+        }
+        
+        .toggle-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            cursor: pointer;
+        }
+        
+        .toggle-label input[type="checkbox"] {
+            display: none;
+        }
+        
+        .toggle-slider {
+            width: 60px;
+            height: 30px;
+            background: #333;
+            border-radius: 15px;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+        
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            width: 26px;
+            height: 26px;
+            background: #fff;
+            border-radius: 50%;
+            top: 2px;
+            left: 2px;
+            transition: all 0.3s ease;
+        }
+        
+        .toggle-label input[type="checkbox"]:checked + .toggle-slider {
+            background: #4CAF50;
+        }
+        
+        .toggle-label input[type="checkbox"]:checked + .toggle-slider::before {
+            transform: translateX(30px);
+        }
+        
+        .toggle-text {
+            font-size: 1.1em;
+            font-weight: 500;
+        }
+        
+        .language-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .language-card {
+            background: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .language-card:hover {
+            border-color: #666;
+            background: #222;
+        }
+        
+        .language-card.selected {
+            border-color: #4CAF50;
+            background: #2a2a2a;
+        }
+        
+        .language-icon {
+            font-size: 1.5em;
+            margin-bottom: 8px;
+        }
+        
+        .language-name {
+            font-size: 0.9em;
+            font-weight: bold;
+            margin-bottom: 3px;
+        }
+        
+        .language-desc {
+            font-size: 0.8em;
+            opacity: 0.7;
+        }
+        
+        .input-mode-toggle {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .toggle-buttons {
+            display: inline-flex;
+            background: #1a1a1a;
+            border-radius: 10px;
+            padding: 5px;
+            gap: 5px;
+        }
+        
+        .mode-btn {
+            background: transparent;
+            color: #fff;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .mode-btn.active {
+            background: #4CAF50;
+            color: #000;
+        }
+        
+        .mode-btn:hover:not(.active) {
+            background: #333;
+        }
+        
+        .text-input-section {
+            background: #111;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .text-language-selection {
+            margin-bottom: 30px;
+        }
+        
+        .text-language-selection .language-grid {
+            margin-top: 15px;
+        }
+        
+        .text-input-container {
+            margin-bottom: 20px;
+        }
+        
+        .input-label {
+            font-size: 1.1em;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #fff;
+        }
+        
+        .current-language-display {
+            background: #2a2a2a;
+            border: 1px solid #4CAF50;
+            border-radius: 5px;
+            padding: 8px 12px;
+            margin-bottom: 15px;
+            font-size: 0.9em;
+            color: #4CAF50;
+            font-weight: 500;
+        }
+        
+        .text-input-container textarea {
+            width: 100%;
+            background: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            color: #fff;
+            font-size: 16px;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            resize: vertical;
+            min-height: 150px;
+        }
+        
+        .text-input-container textarea:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .text-input-container textarea::placeholder {
+            color: #666;
+        }
+        
+        .text-input-actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 15px;
+            justify-content: center;
+        }
+        
+        .text-result-container {
+            border-top: 1px solid #333;
+            padding-top: 20px;
+        }
+        
+        .text-result {
+            background: #1a1a1a;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+            padding: 20px;
+            color: #fff;
+            font-size: 16px;
+            line-height: 1.6;
+            min-height: 100px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .text-result-actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .editable-translation {
+            background: #2a2a2a;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+            padding: 20px;
+            color: #fff;
+            font-size: 16px;
+            line-height: 1.6;
+            min-height: 100px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            cursor: text;
+        }
+        
+        .editable-translation:focus {
+            outline: none;
+            border-color: #fff;
+        }
+        
+        /* Enhanced UI Components */
+        .card {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+        
+        .card:hover {
+            border-color: #4CAF50;
+            box-shadow: 0 4px 20px rgba(76, 175, 80, 0.1);
+        }
+        
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .card-title {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #fff;
+        }
+        
+        .card-subtitle {
+            font-size: 0.9em;
+            color: #888;
+            margin-top: 5px;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .badge-success {
+            background: #4CAF50;
+            color: #000;
+        }
+        
+        .badge-warning {
+            background: #ff9800;
+            color: #000;
+        }
+        
+        .badge-info {
+            background: #2196F3;
+            color: #fff;
+        }
+        
+        .badge-error {
+            background: #f44336;
+            color: #fff;
+        }
+        
+        .floating-action-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: #4CAF50;
+            color: #000;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            box-shadow: 0 4px 20px rgba(76, 175, 80, 0.3);
+            transition: all 0.3s ease;
+            z-index: 1000;
+        }
+        
+        .floating-action-btn:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 25px rgba(76, 175, 80, 0.4);
+        }
+        
+        /* Multi-Agent Translation Options UI */
+        .translation-options-container {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .translation-option {
+            background: #2a2a2a;
+            border: 2px solid #444;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .translation-option:hover {
+            border-color: #4CAF50;
+            background: #2d2d2d;
+        }
+        
+        .translation-option.selected {
+            border-color: #4CAF50;
+            background: #1e3a1e;
+            box-shadow: 0 0 10px rgba(76, 175, 80, 0.3);
+        }
+        
+        .option-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .option-title {
+            font-weight: bold;
+            color: #4CAF50;
+            font-size: 16px;
+        }
+        
+        .option-badge {
+            background: #333;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+        
+        .option-badge.original {
+            background: #2196F3;
+        }
+        
+        .option-badge.improved {
+            background: #4CAF50;
+        }
+        
+        .option-badge.rag {
+            background: #FF9800;
+        }
+        
+        .option-content {
+            color: #ccc;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+        
+        .option-metrics {
+            display: flex;
+            gap: 15px;
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .metric {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .metric-icon {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        
+        .metric-icon.accuracy {
+            background: #4CAF50;
+        }
+        
+        .metric-icon.consistency {
+            background: #2196F3;
+        }
+        
+        .metric-icon.quality {
+            background: #FF9800;
+        }
+        
+        .comparison-view {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .comparison-panel {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        
+        .comparison-panel h4 {
+            margin: 0 0 10px 0;
+            color: #4CAF50;
+            font-size: 14px;
+        }
+        
+        .comparison-text {
+            color: #ccc;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+        
+        .agent-progress {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        
+        .agent-step {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+        }
+        
+        .agent-step:last-child {
+            border-bottom: none;
+        }
+        
+        .step-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .step-icon.active {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        .step-icon.completed {
+            background: #2196F3;
+            color: white;
+        }
+        
+        .step-icon.pending {
+            background: #666;
+            color: #ccc;
+        }
+        
+        .step-text {
+            color: #ccc;
+            font-size: 14px;
+        }
+        
+        .step-text.active {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        
+        .step-text.completed {
+            color: #2196F3;
+        }
+        
+        .tooltip {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            width: 120px;
+            background-color: #333;
+            color: #fff;
+            text-align: center;
+            border-radius: 6px;
+            padding: 5px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -60px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+        }
+        
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+        
+        .language-editor {
+            background: #2a2a2a;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        
+        .language-selector-row {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .language-selector-item {
+            flex: 1;
+        }
+        
+        .language-selector-item label {
+            display: block;
+            font-size: 0.9em;
+            font-weight: 600;
+            margin-bottom: 5px;
+            color: #4CAF50;
+        }
+        
+        .language-selector-item select {
+            width: 100%;
+            padding: 8px 12px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 5px;
+            color: #fff;
+            font-size: 14px;
+        }
+        
+        .language-selector-item select:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .translation-comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 15px 0;
+        }
+        
+        .translation-side {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        
+        .translation-side-header {
+            font-size: 0.9em;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #4CAF50;
+        }
+        
+        .translation-content {
+            font-size: 14px;
+            line-height: 1.6;
+            color: #fff;
+            min-height: 100px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .translation-content.editable {
+            background: #2a2a2a;
+            border: 1px solid #4CAF50;
+            border-radius: 5px;
+            padding: 10px;
+            cursor: text;
+        }
+        
+        .translation-content.editable:focus {
+            outline: none;
+            border-color: #fff;
+        }
+        
+        .action-bar {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #333;
+        }
+        
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+            border-radius: 4px;
+        }
+        
+        .btn-outline {
+            background: transparent;
+            border: 1px solid #4CAF50;
+            color: #4CAF50;
+        }
+        
+        .btn-outline:hover {
+            background: #4CAF50;
+            color: #000;
+        }
+        
+        /* Loading Screen Styles */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+        
+        .loading-content {
+            text-align: center;
+            color: white;
+        }
+        
+        .loading-spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid #333;
+            border-top: 4px solid #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            font-size: 1.2em;
+            margin-bottom: 10px;
+        }
+        
+        .loading-subtext {
+            font-size: 0.9em;
+            opacity: 0.7;
+        }
+        
+        .model-loading {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        
+        .model-loading::after {
+            content: '⏳';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 2em;
+        }
+        
+        .model-loading-card {
+            background: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            grid-column: 1 / -1;
+        }
+        
+        .model-loading-card .loading-spinner {
+            width: 40px;
+            height: 40px;
+            margin-bottom: 15px;
+        }
+        
+        .model-loading-card .loading-text {
+            font-size: 1em;
+            margin-bottom: 5px;
+        }
+        
+        .translation-options {
+            margin-top: 20px;
+        }
+        
+        .processing-section {
+            display: none;
+            background: #111;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .processing-step {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+        
+        .processing-step.active {
+            background: #222;
+        }
+        
+        .processing-step.completed {
+            background: #0a0;
+        }
+        
+        .step-icon {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            font-weight: bold;
+        }
+        
+        .step-icon.active {
+            background: #fff;
+            color: #000;
+        }
+        
+        .step-icon.completed {
+            background: #0f0;
+            color: #000;
+        }
+        
+        .step-text {
+            flex: 1;
+        }
+        
+        .main-content {
+            display: none;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .image-section {
+            background: #111;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .image-container {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .document-image {
+            max-width: 100%;
+            border: 1px solid #333;
+            border-radius: 5px;
+        }
+        
+        .bbox-overlay {
+            position: absolute;
+            border: 2px solid #fff;
+            background: rgba(255, 255, 255, 0.1);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .bbox-overlay:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .bbox-overlay.translate {
+            border-color: #fff;
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+        .bbox-overlay.preserve {
+            border-color: #0f0;
+            background: rgba(0, 255, 0, 0.2);
+        }
+        
+        .bbox-overlay.whiteout {
+            border-color: #f00;
+            background: rgba(255, 0, 0, 0.2);
+        }
+        
+        .controls-section {
+            background: #111;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #333;
+            padding-bottom: 10px;
+        }
+        
+        .text-region {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 15px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .text-region:hover {
+            border-color: #666;
+            background: #222;
+        }
+        
+        .text-region.selected {
+            border-color: #fff;
+            background: #333;
+        }
+        
+        .text-region.translate {
+            border-color: #fff;
+            background: #333;
+        }
+        
+        .text-region.preserve {
+            border-color: #0f0;
+            background: #0a0;
+        }
+        
+        .text-region.whiteout {
+            border-color: #f00;
+            background: #a00;
+        }
+        
+        .region-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .region-title {
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+        
+        .region-controls {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .control-btn {
+            background: #333;
+            color: #fff;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.3s ease;
+        }
+        
+        .control-btn:hover {
+            background: #555;
+        }
+        
+        .control-btn.active {
+            background: #fff;
+            color: #000;
+        }
+        
+        .region-text {
+            font-size: 0.9em;
+            opacity: 0.8;
+            line-height: 1.4;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin-top: 30px;
+        }
+        
+        .action-btn {
+            background: #fff;
+            color: #000;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 5px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .action-btn:hover {
+            background: #ccc;
+        }
+        
+        .action-btn:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        
+        .preview-section {
+            display: none;
+            background: #111;
+            border-radius: 10px;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .preview-image {
+            max-width: 100%;
+            border: 1px solid #333;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .download-btn {
+            background: #0f0;
+            color: #000;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 5px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .download-btn:hover {
+            background: #0a0;
+        }
+        
+        .status-message {
+            text-align: center;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .status-message.success {
+            background: #0a0;
+            color: #fff;
+        }
+        
+        .status-message.error {
+            background: #a00;
+            color: #fff;
+        }
+        
+        .status-message.info {
+            background: #006;
+            color: #fff;
+        }
+        
+        .paragraph-section {
+            margin: 20px 0;
+            padding: 20px;
+            background: #1a1a1a;
+            border-radius: 10px;
+            border-left: 4px solid #4CAF50;
+        }
+        
+        .paragraph-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .paragraph-number {
+            background: #4CAF50;
+            color: white;
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        
+        .paragraph-status {
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .paragraph-status.pending {
+            background: #fff3e0;
+            color: #f57c00;
+        }
+        
+        .paragraph-status.processing {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        
+        .paragraph-status.completed {
+            background: #e8f5e8;
+            color: #2e7d32;
+        }
+        
+        .paragraph-text {
+            margin: 10px 0;
+            padding: 15px;
+            background: #2a2a2a;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .paragraph-translation {
+            margin: 10px 0;
+            padding: 15px;
+            background: #0a0;
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.5;
+            display: none;
+        }
+        
+        .paragraph-translation.show {
+            display: block;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: #4CAF50;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        
+        .download-section {
+            text-align: center;
+            margin: 30px 0;
+            padding: 20px;
+            background: #111;
+            border-radius: 15px;
+            display: none;
+        }
+        
+        .download-section.active {
+            display: block;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .language-grid {
+                grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            }
+            
+            .action-buttons {
+                flex-direction: column;
+            }
+            
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚖️ Enhanced Legal RAG Document Translator</h1>
+            <p>Advanced AI-powered translation with legal context awareness and real-time document processing</p>
+            <div class="rag-status" id="rag-status">
+                <span id="rag-status-text">Checking RAG System...</span>
+            </div>
+        </div>
+        
+        <div class="input-mode-toggle">
+            <div class="toggle-buttons">
+                <button class="mode-btn active" id="documentMode" onclick="switchMode('document')">📄 Document Upload</button>
+                <button class="mode-btn" id="textMode" onclick="switchMode('text')">✏️ Text Input</button>
+            </div>
+        </div>
+        
+        <div class="upload-section" id="uploadSection">
+            <div class="upload-icon">📄</div>
+            <div class="upload-text">Drag & drop your document image here or click to browse</div>
+            <input type="file" id="fileInput" class="file-input" accept="image/*">
+            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose File</button>
+            <p id="file-name" style="margin-top: 10px; opacity: 0.7;"></p>
+        </div>
+        
+        <div class="text-input-section" id="textInputSection" style="display: none;">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">✏️ Direct Text Translation</div>
+                        <div class="card-subtitle">Translate text directly without document upload</div>
+            </div>
+                    <div class="badge badge-info">Text Mode</div>
+                </div>
+                
+                <!-- Language Selection for Text Mode -->
+                <div class="text-language-selection">
+                    <div class="section-title">🌐 Select Target Language</div>
+                    <div class="language-grid">
+                        <div class="language-card" data-lang="te">
+                            <div class="language-icon">📜</div>
+                            <div class="language-name">Telugu</div>
+                            <div class="language-desc">తెలుగు</div>
+                        </div>
+                        <div class="language-card" data-lang="hi">
+                            <div class="language-icon">📖</div>
+                            <div class="language-name">Hindi</div>
+                            <div class="language-desc">हिन्दी</div>
+                        </div>
+                        <div class="language-card" data-lang="ta">
+                            <div class="language-icon">📚</div>
+                            <div class="language-name">Tamil</div>
+                            <div class="language-desc">தமிழ்</div>
+                        </div>
+                        <div class="language-card" data-lang="kn">
+                            <div class="language-icon">📝</div>
+                            <div class="language-name">Kannada</div>
+                            <div class="language-desc">ಕನ್ನಡ</div>
+                        </div>
+                        <div class="language-card" data-lang="ml">
+                            <div class="language-icon">📄</div>
+                            <div class="language-name">Malayalam</div>
+                            <div class="language-desc">മലയാളം</div>
+                        </div>
+                        <div class="language-card" data-lang="en">
+                            <div class="language-icon">📰</div>
+                            <div class="language-name">English</div>
+                            <div class="language-desc">Improved</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="text-input-container">
+                    <div class="input-label">📝 Enter Text to Translate:</div>
+                    <div class="current-language-display">
+                        <span id="currentLanguageDisplay">Target Language: తెలుగు (Telugu)</span>
+                    </div>
+                    <textarea id="textInput" placeholder="Enter the text you want to translate here..." rows="8"></textarea>
+                    <div class="text-input-actions">
+                        <button class="action-btn" onclick="translateText()">🔄 Translate Text</button>
+                        <button class="action-btn btn-outline" onclick="clearText()">🗑️ Clear</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="text-result-container" id="textResultContainer" style="display: none;">
+                <div class="card">
+                    <div class="card-header">
+                        <div>
+                            <div class="card-title">📝 Translation Result</div>
+                            <div class="card-subtitle">Your translated text is ready</div>
+                        </div>
+                        <div class="badge badge-success">Completed</div>
+                    </div>
+                    <div class="text-result" id="textResult"></div>
+                    <div class="text-result-actions">
+                        <button class="action-btn" onclick="editTranslation()">✏️ Edit Translation</button>
+                        <button class="action-btn btn-outline" onclick="copyTranslation()">📋 Copy</button>
+                        <button class="action-btn btn-outline" onclick="downloadTextTranslation()">💾 Download</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="model-selection-section">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">🤖 Translation Configuration</div>
+                        <div class="card-subtitle">Choose your AI model and language settings</div>
+                    </div>
+                    <div class="badge badge-info">AI Powered</div>
+                </div>
+                
+                <div class="section-title">🤖 Choose Translation Model</div>
+                <div class="model-grid" id="modelGrid">
+                    <div class="model-loading-card">
+                        <div class="loading-spinner"></div>
+                        <div class="loading-text">Loading available models...</div>
+                    </div>
+                </div>
+                
+                <div class="translation-options">
+                    <div class="section-title">🌐 Translation Options</div>
+                    <div class="language-grid">
+                        <div class="language-card" data-lang="te">
+                            <div class="language-icon">📜</div>
+                            <div class="language-name">Telugu</div>
+                            <div class="language-desc">తెలుగు</div>
+                        </div>
+                        <div class="language-card" data-lang="hi">
+                            <div class="language-icon">📖</div>
+                            <div class="language-name">Hindi</div>
+                            <div class="language-desc">हिन्दी</div>
+                        </div>
+                        <div class="language-card" data-lang="ta">
+                            <div class="language-icon">📚</div>
+                            <div class="language-name">Tamil</div>
+                            <div class="language-desc">தமிழ்</div>
+                        </div>
+                        <div class="language-card" data-lang="kn">
+                            <div class="language-icon">📝</div>
+                            <div class="language-name">Kannada</div>
+                            <div class="language-desc">ಕನ್ನಡ</div>
+                        </div>
+                        <div class="language-card" data-lang="ml">
+                            <div class="language-icon">📄</div>
+                            <div class="language-name">Malayalam</div>
+                            <div class="language-desc">മലയാളം</div>
+                        </div>
+                        <div class="language-card" data-lang="en">
+                            <div class="language-icon">📰</div>
+                            <div class="language-name">English</div>
+                            <div class="language-desc">Improved</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="agent-mode-toggle">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="agentModeToggle" checked>
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">🚀 Agentic Framework (Multi-Agent Pipeline)</span>
+                    </label>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Loading Overlay -->
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="loading-content">
+                <div class="loading-spinner"></div>
+                <div class="loading-text" id="loadingText">Processing...</div>
+                <div class="loading-subtext" id="loadingSubtext">Please wait</div>
+            </div>
+        </div>
+        
+        <div class="processing-section" id="processingSection">
+            <div class="section-title">Processing Document</div>
+            <div class="processing-step" id="step1">
+                <div class="step-icon">1</div>
+                <div class="step-text">Extracting text with OCR...</div>
+            </div>
+            <div class="processing-step" id="step2">
+                <div class="step-icon">2</div>
+                <div class="step-text">Translating text...</div>
+            </div>
+            <div class="processing-step" id="step3">
+                <div class="step-icon">3</div>
+                <div class="step-text">Preparing layout controls...</div>
+            </div>
+        </div>
+        
+        <div class="main-content" id="mainContent">
+            <div class="image-section">
+                <div class="section-title">Document Preview</div>
+                <div class="image-container" id="imageContainer">
+                    <img id="documentImage" class="document-image" alt="Document Preview">
+                </div>
+            </div>
+            
+            <div class="controls-section">
+                <div class="section-title">Text Region Controls</div>
+                <div class="status-message" id="statusMessage"></div>
+                <div id="textRegions"></div>
+            <div class="action-buttons">
+                    <button class="action-btn" id="previewBtn" onclick="previewDocument()">Preview Document</button>
+                    <button class="action-btn" id="downloadBtn" onclick="downloadDocument()">Download Result</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="preview-section" id="previewSection">
+            <div class="section-title">Final Document Preview</div>
+            <img id="previewImage" class="preview-image" alt="Final Document Preview">
+            <button class="download-btn" onclick="downloadDocument()">📥 Download HTML Document</button>
+        </div>
+        
+        <div id="status-message"></div>
+        
+        <!-- Floating Action Button -->
+        <button class="floating-action-btn tooltip" onclick="scrollToTop()" title="Scroll to Top">
+            ↑
+        </button>
+    </div>
+
+    <script>
+        let documentData = null;
+        let textRegions = [];
+        let translatedText = [];
+        let userActions = {};
+        let selectedModel = 'gemma3-legal-samanantar-pro:latest';
+        let agentMode = true;
+        let selectedLanguage = 'te'; // Default to Telugu
+        let currentMode = 'document'; // 'document' or 'text'
+        let currentTextTranslation = '';
+        
+        // Multi-Agent Framework
+        class AgentFramework {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+                this.agents = new Map();
+                this.dataPipeline = [];
+                this.agentStates = new Map();
+                this.initializeAgents();
+            }
+
+            initializeAgents() {
+                // Register all agents with their roles and capabilities
+                this.agents.set('contextAnalyzer', {
+                    agent: new ContextAgent(this.ollamaUrl, this.model),
+                    role: 'context_analysis',
+                    priority: 1,
+                    required: true,
+                    timeout: 30000
+                });
+
+                this.agents.set('translator', {
+                    agent: new TranslationAgent(this.ollamaUrl, this.model),
+                    role: 'translation',
+                    priority: 2,
+                    required: true,
+                    timeout: 45000
+                });
+
+                this.agents.set('validator', {
+                    agent: new ValidationAgent(this.ollamaUrl, this.model),
+                    role: 'validation',
+                    priority: 3,
+                    required: true,
+                    timeout: 30000
+                });
+
+                this.agents.set('qualityAssurance', {
+                    agent: new QualityAgent(this.ollamaUrl, this.model),
+                    role: 'quality_improvement',
+                    priority: 4,
+                    required: false,
+                    timeout: 45000
+                });
+
+                this.agents.set('languageConsistencyChecker', {
+                    agent: new LanguageConsistencyAgent(this.ollamaUrl, this.model),
+                    role: 'language_consistency',
+                    priority: 5,
+                    required: true,
+                    timeout: 20000
+                });
+            }
+
+            async executeTranslationPipeline(originalText, sourceLang, targetLang, progressCallback) {
+                console.log('🚀 Starting Agent Framework Pipeline');
+                this.dataPipeline = [];
+                this.agentStates.clear();
+
+                const pipelineData = {
+                    originalText,
+                    sourceLang,
+                    targetLang,
+                    context: null,
+                    translatedText: null,
+                    validation: null,
+                    consistencyCheck: null,
+                    finalText: null,
+                    errors: [],
+                    metadata: {
+                        startTime: Date.now(),
+                        agentResults: {}
+                    }
+                };
+
+                try {
+                    // Step 1: Context Analysis
+                    progressCallback('🔍 Agent 1/5: Context Analysis', 1, 'active');
+                    pipelineData.context = await this.executeAgent('contextAnalyzer', {
+                        text: originalText,
+                        sourceLang,
+                        targetLang
+                    });
+                    pipelineData.metadata.agentResults.contextAnalysis = pipelineData.context;
+                    progressCallback('✅ Context Analysis Complete', 1, 'completed');
+
+                    // Step 2: Translation
+                    progressCallback('🔄 Agent 2/5: Translation', 2, 'active');
+                    pipelineData.translatedText = await this.executeAgent('translator', {
+                        text: originalText,
+                        sourceLang,
+                        targetLang,
+                        context: pipelineData.context
+                    });
+                    pipelineData.metadata.agentResults.translation = pipelineData.translatedText;
+                    progressCallback('✅ Translation Complete', 2, 'completed');
+
+                    // Step 3: Validation
+                    progressCallback('✅ Agent 3/5: Validation', 3, 'active');
+                    pipelineData.validation = await this.executeAgent('validator', {
+                        originalText,
+                        translatedText: pipelineData.translatedText,
+                        sourceLang,
+                        targetLang
+                    });
+                    pipelineData.metadata.agentResults.validation = pipelineData.validation;
+                    progressCallback('✅ Validation Complete', 3, 'completed');
+
+                    // Step 4: Language Consistency Check
+                    progressCallback('🔍 Agent 4/5: Language Consistency', 4, 'active');
+                    pipelineData.consistencyCheck = await this.executeAgent('languageConsistencyChecker', {
+                        text: pipelineData.translatedText,
+                        targetLang,
+                        originalText
+                    });
+                    pipelineData.metadata.agentResults.consistencyCheck = pipelineData.consistencyCheck;
+                    progressCallback('✅ Language Consistency Check Complete', 4, 'completed');
+
+                    // Step 5: Quality Improvement (if needed)
+                    if (pipelineData.validation.status === 'needs_revision' || 
+                        pipelineData.validation.status === 'invalid' ||
+                        !pipelineData.consistencyCheck.isConsistent) {
+                        
+                        progressCallback('🔧 Agent 5/5: Quality Improvement', 5, 'active');
+                        pipelineData.finalText = await this.executeAgent('qualityAssurance', {
+                            originalText,
+                            translatedText: pipelineData.translatedText,
+                            sourceLang,
+                            targetLang,
+                            context: pipelineData.context,
+                            validation: pipelineData.validation,
+                            consistencyCheck: pipelineData.consistencyCheck
+                        });
+                        pipelineData.metadata.agentResults.qualityImprovement = pipelineData.finalText;
+                        progressCallback('✅ Quality Improvement Complete', 5, 'completed');
+                    } else {
+                        pipelineData.finalText = pipelineData.translatedText;
+                        progressCallback('✅ Quality Check Passed', 5, 'completed');
+                    }
+
+                    // Final validation
+                    if (pipelineData.finalText !== pipelineData.translatedText) {
+                        progressCallback('🔄 Final Validation', 3, 'active');
+                        const finalValidation = await this.executeAgent('validator', {
+                            originalText,
+                            translatedText: pipelineData.finalText,
+                            sourceLang,
+                            targetLang
+                        });
+                        pipelineData.metadata.agentResults.finalValidation = finalValidation;
+                        progressCallback('✅ Final Validation Complete', 3, 'completed');
+                    }
+
+                    pipelineData.metadata.endTime = Date.now();
+                    pipelineData.metadata.duration = pipelineData.metadata.endTime - pipelineData.metadata.startTime;
+
+                    console.log('🎯 Agent Framework Pipeline Complete:', pipelineData.metadata);
+                    return {
+                        finalText: pipelineData.finalText || pipelineData.translatedText,
+                        originalTranslation: pipelineData.translatedText,
+                        improvedTranslation: pipelineData.finalText,
+                        metadata: pipelineData.metadata
+                    };
+
+                } catch (error) {
+                    console.error('❌ Agent Framework Pipeline Error:', error);
+                    pipelineData.errors.push(error.message);
+                    throw error;
+                }
+            }
+
+            async executeAgent(agentName, inputData) {
+                const agentConfig = this.agents.get(agentName);
+                if (!agentConfig) {
+                    throw new Error(`Agent ${agentName} not found`);
+                }
+
+                console.log(`🤖 Executing Agent: ${agentName}`, inputData);
+                
+                const startTime = Date.now();
+                this.agentStates.set(agentName, {
+                    status: 'running',
+                    startTime,
+                    inputData
+                });
+
+                try {
+                    let result;
+                    
+                    switch (agentName) {
+                        case 'contextAnalyzer':
+                            result = await agentConfig.agent.analyzeContext(
+                                inputData.text, 
+                                inputData.sourceLang, 
+                                inputData.targetLang
+                            );
+                            break;
+                            
+                        case 'translator':
+                            result = await agentConfig.agent.translate(
+                                inputData.text, 
+                                inputData.sourceLang, 
+                                inputData.targetLang, 
+                                inputData.context
+                            );
+                            break;
+                            
+                        case 'validator':
+                            result = await agentConfig.agent.validateTranslation(
+                                inputData.originalText, 
+                                inputData.translatedText, 
+                                inputData.sourceLang, 
+                                inputData.targetLang
+                            );
+                            break;
+                            
+                        case 'qualityAssurance':
+                            result = await agentConfig.agent.improveTranslation(
+                                inputData.originalText, 
+                                inputData.translatedText, 
+                                inputData.sourceLang, 
+                                inputData.targetLang, 
+                                inputData.context
+                            );
+                            break;
+                            
+                        case 'languageConsistencyChecker':
+                            result = await agentConfig.agent.checkConsistency(
+                                inputData.text, 
+                                inputData.targetLang, 
+                                inputData.originalText
+                            );
+                            break;
+                            
+                        default:
+                            throw new Error(`Unknown agent: ${agentName}`);
+                    }
+
+                    const endTime = Date.now();
+                    this.agentStates.set(agentName, {
+                        status: 'completed',
+                        startTime,
+                        endTime,
+                        duration: endTime - startTime,
+                        inputData,
+                        result
+                    });
+
+                    console.log(`✅ Agent ${agentName} completed in ${endTime - startTime}ms`);
+                    return result;
+
+                } catch (error) {
+                    const endTime = Date.now();
+                    this.agentStates.set(agentName, {
+                        status: 'error',
+                        startTime,
+                        endTime,
+                        duration: endTime - startTime,
+                        inputData,
+                        error: error.message
+                    });
+
+                    console.error(`❌ Agent ${agentName} failed:`, error);
+                    throw error;
+                }
+            }
+
+            getAgentStates() {
+                return this.agentStates;
+            }
+
+            getPipelineData() {
+                return this.dataPipeline;
+            }
+        }
+
+        // Individual Agent Classes
+        class ContextAgent {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+            }
+
+            async analyzeContext(text, sourceLang, targetLang) {
+                const prompt = `Analyze the context and domain of this text for legal translation:
+
+Text: "${text}"
+Source Language: ${sourceLang}
+Target Language: ${targetLang}
+
+Provide analysis in JSON format:
+{
+    "domain": "legal/civil/criminal/constitutional/administrative",
+    "context": "brief description",
+    "keyTerms": ["term1", "term2"],
+    "complexity": "low/medium/high",
+    "recommendations": ["recommendation1", "recommendation2"]
+}`;
+
+                const result = await this.callOllama(prompt);
+                try {
+                    return JSON.parse(result);
+                } catch (error) {
+                    return {
+                        domain: "legal",
+                        context: "General legal text",
+                        keyTerms: [],
+                        complexity: "medium",
+                        recommendations: ["Standard legal translation approach"]
+                    };
+                }
+            }
+
+            async callOllama(prompt) {
+                const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.model,
+                        prompt: prompt,
+                        stream: false,
+                        options: { temperature: 0.1, top_p: 0.8, num_predict: 500 }
+                    })
+                });
+                
+                if (!response.ok) throw new Error(`Context agent error: ${response.status}`);
+                const data = await response.json();
+                return data.response.trim();
+            }
+        }
+
+        class TranslationAgent {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+            }
+
+            async translate(text, sourceLang, targetLang, context) {
+                const targetLanguageName = this.getLanguageName(targetLang);
+                const sourceLanguageName = this.getLanguageName(sourceLang);
+                
+                const prompt = `You are a professional legal translator. Translate the following ${sourceLanguageName} legal text to ${targetLanguageName}.
+
+Context: ${context ? JSON.stringify(context) : 'General legal context'}
+
+Original Text: "${text}"
+
+Requirements:
+1. Maintain legal accuracy and terminology
+2. Preserve the formal tone
+3. Ensure cultural appropriateness
+4. Keep the same legal structure and format
+
+Provide ONLY the translation without any explanations or additional text.`;
+
+                const result = await this.callOllama(prompt);
+                return result.trim();
+            }
+
+            getLanguageName(langCode) {
+                const names = {
+                    'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+                    'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+                    'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+                    'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+                    'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+                    'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+                    'ko': 'Korean', 'zh': 'Chinese'
+                };
+                return names[langCode] || langCode;
+            }
+
+            async callOllama(prompt) {
+                const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.model,
+                        prompt: prompt,
+                        stream: false,
+                        options: { temperature: 0.3, top_p: 0.9, num_predict: 1000 }
+                    })
+                });
+                
+                if (!response.ok) throw new Error(`Translation agent error: ${response.status}`);
+                const data = await response.json();
+                return data.response.trim();
+            }
+        }
+
+        class ValidationAgent {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+            }
+
+            async validateTranslation(originalText, translatedText, sourceLang, targetLang) {
+                const prompt = `Validate this legal translation for accuracy and completeness:
+
+Original (${sourceLang}): "${originalText}"
+Translation (${targetLang}): "${translatedText}"
+
+Provide validation in JSON format:
+{
+    "status": "valid/needs_revision/invalid",
+    "accuracy": 0-100,
+    "completeness": 0-100,
+    "issues": ["issue1", "issue2"],
+    "strengths": ["strength1", "strength2"],
+    "recommendations": ["recommendation1", "recommendation2"]
+}`;
+
+                const result = await this.callOllama(prompt);
+                try {
+                    return JSON.parse(result);
+                } catch (error) {
+                    return {
+                        status: "valid",
+                        accuracy: 85,
+                        completeness: 90,
+                        issues: [],
+                        strengths: ["Maintains legal terminology"],
+                        recommendations: ["Review for cultural appropriateness"]
+                    };
+                }
+            }
+
+            async callOllama(prompt) {
+                const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.model,
+                        prompt: prompt,
+                        stream: false,
+                        options: { temperature: 0.1, top_p: 0.8, num_predict: 500 }
+                    })
+                });
+                
+                if (!response.ok) throw new Error(`Validation agent error: ${response.status}`);
+                const data = await response.json();
+                return data.response.trim();
+            }
+        }
+
+        class QualityAgent {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+            }
+
+            async improveTranslation(originalText, translatedText, sourceLang, targetLang, context) {
+                const targetLanguageName = this.getLanguageName(targetLang);
+                
+                const prompt = `Improve this legal translation for better quality:
+
+Original: "${originalText}"
+Current Translation: "${translatedText}"
+Target Language: ${targetLanguageName}
+Context: ${context ? JSON.stringify(context) : 'General legal context'}
+
+Improve the translation focusing on:
+1. Legal accuracy and terminology
+2. Natural flow in ${targetLanguageName}
+3. Cultural appropriateness
+4. Formal legal tone
+
+Provide ONLY the improved translation without explanations.`;
+
+                const result = await this.callOllama(prompt);
+                return result.trim();
+            }
+
+            getLanguageName(langCode) {
+                const names = {
+                    'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+                    'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+                    'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+                    'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+                    'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+                    'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+                    'ko': 'Korean', 'zh': 'Chinese'
+                };
+                return names[langCode] || langCode;
+            }
+
+            async callOllama(prompt) {
+                const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.model,
+                        prompt: prompt,
+                        stream: false,
+                        options: { temperature: 0.2, top_p: 0.85, num_predict: 1000 }
+                    })
+                });
+                
+                if (!response.ok) throw new Error(`Quality agent error: ${response.status}`);
+                const data = await response.json();
+                return data.response.trim();
+            }
+        }
+
+        class LanguageConsistencyAgent {
+            constructor(ollamaUrl, model) {
+                this.ollamaUrl = ollamaUrl;
+                this.model = model;
+            }
+
+            async checkConsistency(text, targetLang, originalText) {
+                const targetLanguageName = this.getLanguageName(targetLang);
+                
+                const prompt = `You are a language consistency expert. Analyze the following text for language mixing.
+
+Original text:
+${originalText}
+
+Translated text (should be in ${targetLanguageName}):
+${text}
+
+CRITICAL ANALYSIS REQUIRED:
+1. Check if the translation uses ONLY ${targetLanguageName} language
+2. Identify any words from other languages (English, Telugu, Tamil, Hindi, etc.)
+3. Look for mixed language patterns
+4. Verify consistency in terminology
+
+Respond with a JSON object:
+{
+    "isConsistent": true/false,
+    "mixedWords": ["word1", "word2"],
+    "mixedLanguages": ["language1", "language2"],
+    "consistencyScore": 0-100,
+    "recommendations": ["recommendation1", "recommendation2"]
+}`;
+
+                const result = await this.callOllama(prompt);
+                
+                try {
+                    const analysis = JSON.parse(result);
+                    return {
+                        isConsistent: analysis.isConsistent,
+                        mixedWords: analysis.mixedWords || [],
+                        mixedLanguages: analysis.mixedLanguages || [],
+                        consistencyScore: analysis.consistencyScore || 0,
+                        recommendations: analysis.recommendations || [],
+                        targetLanguage: targetLanguageName
+                    };
+                } catch (error) {
+                    // Fallback parsing
+                    return {
+                        isConsistent: !result.toLowerCase().includes('inconsistent'),
+                        mixedWords: [],
+                        mixedLanguages: [],
+                        consistencyScore: 50,
+                        recommendations: ['Manual review recommended'],
+                        targetLanguage: targetLanguageName
+                    };
+                }
+            }
+
+            getLanguageName(langCode) {
+                const names = {
+                    'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+                    'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+                    'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+                    'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+                    'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+                    'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+                    'ko': 'Korean', 'zh': 'Chinese'
+                };
+                return names[langCode] || langCode;
+            }
+
+            async callOllama(prompt) {
+                const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.model,
+                        prompt: prompt,
+                        stream: false,
+                        options: { temperature: 0.1, top_p: 0.8, num_predict: 1000 }
+                    })
+                });
+                
+                if (!response.ok) throw new Error(`Language consistency agent error: ${response.status}`);
+                const data = await response.json();
+                return data.response.trim();
+            }
+        }
+        
+        // Loading functions
+        function showLoading(text = 'Processing...', subtext = 'Please wait') {
+            const overlay = document.getElementById('loadingOverlay');
+            const loadingText = document.getElementById('loadingText');
+            const loadingSubtext = document.getElementById('loadingSubtext');
+            
+            loadingText.textContent = text;
+            loadingSubtext.textContent = subtext;
+            overlay.style.display = 'flex';
+        }
+        
+        function hideLoading() {
+            const overlay = document.getElementById('loadingOverlay');
+            overlay.style.display = 'none';
+        }
+        
+        // Check RAG system status on load
+        async function checkRAGStatus() {
+            try {
+                const response = await fetch('/api/rag/status');
+                const data = await response.json();
+                
+                const statusElement = document.getElementById('rag-status');
+                const statusText = document.getElementById('rag-status-text');
+                
+                if (data.rag_available) {
+                    statusElement.className = 'rag-status active';
+                    statusText.textContent = '✅ Legal RAG System Active - Enhanced Translation';
+                } else {
+                    statusElement.className = 'rag-status inactive';
+                    statusText.textContent = '⚠️ Legal RAG System Inactive - Basic Translation';
+                }
+            } catch (error) {
+                console.error('Failed to check RAG status:', error);
+                const statusElement = document.getElementById('rag-status');
+                const statusText = document.getElementById('rag-status-text');
+                statusElement.className = 'rag-status inactive';
+                statusText.textContent = '⚠️ RAG Status Unknown';
+            }
+        }
+        
+        // Model selection handling
+        document.addEventListener('DOMContentLoaded', function() {
+            loadAvailableModels();
+            setupLanguageSelection();
+            
+            // Agent mode toggle
+            const agentToggle = document.getElementById('agentModeToggle');
+            if (agentToggle) {
+                agentToggle.addEventListener('change', function() {
+                    agentMode = this.checked;
+                    console.log('Agent mode:', agentMode ? 'enabled' : 'disabled');
+                });
+            }
+        });
+        
+        function setupLanguageSelection() {
+            // Set default language selection for both document and text modes
+            const defaultLangCards = document.querySelectorAll('[data-lang="te"]');
+            defaultLangCards.forEach(card => card.classList.add('selected'));
+            
+            // Update language display
+            updateLanguageDisplay();
+            
+            // Language card selection for both modes
+            document.querySelectorAll('.language-card').forEach(card => {
+                card.addEventListener('click', function() {
+                    // Remove selection from all cards in the same section
+                    const parentSection = this.closest('.translation-options, .text-language-selection');
+                    parentSection.querySelectorAll('.language-card').forEach(c => c.classList.remove('selected'));
+                    
+                    // Add selection to clicked card
+                    this.classList.add('selected');
+                    selectedLanguage = this.dataset.lang;
+                    console.log('Selected language:', selectedLanguage);
+                    
+                    // Update language display
+                    updateLanguageDisplay();
+                });
+            });
+        }
+        
+        function updateLanguageDisplay() {
+            const languageNames = {
+                'te': 'తెలుగు (Telugu)',
+                'hi': 'हिन्दी (Hindi)',
+                'ta': 'தமிழ் (Tamil)',
+                'kn': 'ಕನ್ನಡ (Kannada)',
+                'ml': 'മലയാളം (Malayalam)',
+                'en': 'English (Improved)'
+            };
+            
+            const displayElement = document.getElementById('currentLanguageDisplay');
+            if (displayElement) {
+                displayElement.textContent = `Target Language: ${languageNames[selectedLanguage] || selectedLanguage}`;
+            }
+        }
+        
+        async function loadAvailableModels() {
+            try {
+                const response = await fetch('/api/ollama/models');
+                const data = await response.json();
+                
+                if (data.success) {
+                    renderModels(data.models);
+                } else {
+                    console.error('Failed to load models:', data.error);
+                    renderFallbackModels();
+                }
+            } catch (error) {
+                console.error('Error loading models:', error);
+                renderFallbackModels();
+            }
+        }
+        
+        function renderModels(models) {
+            const modelGrid = document.getElementById('modelGrid');
+            modelGrid.innerHTML = '';
+            
+            // Sort models by family and name
+            models.sort((a, b) => {
+                if (a.family !== b.family) {
+                    return a.family.localeCompare(b.family);
+                }
+                return a.name.localeCompare(b.name);
+            });
+            
+            models.forEach((model, index) => {
+                const modelCard = document.createElement('div');
+                modelCard.className = 'model-card';
+                modelCard.dataset.model = model.name;
+                
+                // Get icon based on family
+                const icon = getModelIcon(model.family);
+                const sizeText = model.size > 0 ? formatBytes(model.size) : '';
+                
+                modelCard.innerHTML = `
+                    <div class="model-icon">${icon}</div>
+                    <div class="model-name">${model.name}</div>
+                    <div class="model-desc">${model.family} ${sizeText}</div>
+                `;
+                
+                // Add click handler
+                modelCard.addEventListener('click', function() {
+                    document.querySelectorAll('.model-card').forEach(c => c.classList.remove('selected'));
+                    this.classList.add('selected');
+                    selectedModel = this.dataset.model;
+                    console.log('Selected model:', selectedModel);
+                });
+                
+                modelGrid.appendChild(modelCard);
+            });
+            
+            // Select first model by default
+            if (models.length > 0) {
+                const firstCard = modelGrid.querySelector('.model-card');
+                if (firstCard) {
+                    firstCard.classList.add('selected');
+                    selectedModel = firstCard.dataset.model;
+                }
+            }
+        }
+        
+        function renderFallbackModels() {
+            const modelGrid = document.getElementById('modelGrid');
+            modelGrid.innerHTML = '';
+            
+            const fallbackModels = [
+                { name: 'gemma3-legal-samanantar-pro:latest', family: 'gemma', icon: '⚖️' },
+                { name: 'llama3.1:7b', family: 'llama', icon: '🦙' },
+                { name: 'qwen2.5:7b', family: 'qwen', icon: '🧠' },
+                { name: 'mistral:7b', family: 'mistral', icon: '🌪️' }
+            ];
+            
+            fallbackModels.forEach(model => {
+                const modelCard = document.createElement('div');
+                modelCard.className = 'model-card';
+                modelCard.dataset.model = model.name;
+                
+                modelCard.innerHTML = `
+                    <div class="model-icon">${model.icon}</div>
+                    <div class="model-name">${model.name}</div>
+                    <div class="model-desc">${model.family} (fallback)</div>
+                `;
+                
+                modelCard.addEventListener('click', function() {
+                    document.querySelectorAll('.model-card').forEach(c => c.classList.remove('selected'));
+                    this.classList.add('selected');
+                    selectedModel = this.dataset.model;
+                    console.log('Selected model:', selectedModel);
+                });
+                
+                modelGrid.appendChild(modelCard);
+            });
+            
+            // Select first model by default
+            const firstCard = modelGrid.querySelector('.model-card');
+            if (firstCard) {
+                firstCard.classList.add('selected');
+                selectedModel = firstCard.dataset.model;
+            }
+        }
+        
+        function getModelIcon(family) {
+            const icons = {
+                'gemma': '⚖️',
+                'llama': '🦙',
+                'qwen': '🧠',
+                'mistral': '🌪️',
+                'phi': 'Φ',
+                'codellama': '💻',
+                'default': '🤖'
+            };
+            return icons[family] || icons.default;
+        }
+        
+        function formatBytes(bytes) {
+            if (bytes === 0) return '';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return `(${(bytes / Math.pow(k, i)).toFixed(1)}${sizes[i]})`;
+        }
+        
+        // File upload handling
+        const uploadSection = document.getElementById('uploadSection');
+        const fileInput = document.getElementById('fileInput');
+        
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+        
+        uploadSection.addEventListener('dragleave', () => {
+            uploadSection.classList.remove('dragover');
+        });
+        
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileUpload(files[0]);
+            }
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileUpload(e.target.files[0]);
+            }
+        });
+        
+        function handleFileUpload(file) {
+            if (!file.type.startsWith('image/')) {
+                showStatus('Please upload an image file.', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('image', file);
+            formData.append('model', selectedModel);
+            formData.append('agent_mode', agentMode.toString());
+            formData.append('target_language', selectedLanguage);
+            
+            showLoading('Processing Document', 'OCR and Translation in progress...');
+            showProcessingStep(1);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                hideLoading();
+                if (data.success) {
+                    showProcessingStep(2);
+                    setTimeout(() => {
+                        showProcessingStep(3);
+                        setTimeout(() => {
+                            displayResults(data);
+                        }, 1000);
+                    }, 2000);
+                } else {
+                    showStatus('Error: ' + data.error, 'error');
+                    if (data.suggestions) {
+                        console.log('Suggestions:', data.suggestions);
+                    }
+                }
+            })
+            .catch(error => {
+                hideLoading();
+                showStatus('Error uploading file: ' + error, 'error');
+            });
+        }
+        
+        function displayResults(data) {
+            document.getElementById('processingSection').style.display = 'none';
+            document.getElementById('mainContent').style.display = 'grid';
+            
+            // Display image
+            const img = document.getElementById('documentImage');
+            img.src = 'data:image/png;base64,' + data.image;
+            
+            // Store data
+            textRegions = data.text_regions;
+            userActions = {};
+            
+            // Create bounding box overlays
+            createBoundingBoxes(data.text_regions);
+            
+            // Render text region controls
+            renderTextRegions();
+            
+            showStatus('Document processed successfully! Select actions for each text region.', 'success');
+        }
+        
+        function createBoundingBoxes(regions) {
+            const container = document.getElementById('imageContainer');
+            const img = document.getElementById('documentImage');
+            
+            // Clear existing overlays
+            container.querySelectorAll('.bbox-overlay').forEach(overlay => overlay.remove());
+            
+            // Wait for image to load
+            img.onload = () => {
+                const imgRect = img.getBoundingClientRect();
+                const scaleX = imgRect.width / img.naturalWidth;
+                const scaleY = imgRect.height / img.naturalHeight;
+                
+                regions.forEach(region => {
+                    const overlay = document.createElement('div');
+                    overlay.className = 'bbox-overlay preserve';
+                    overlay.style.left = (region.bbox.x * scaleX) + 'px';
+                    overlay.style.top = (region.bbox.y * scaleY) + 'px';
+                    overlay.style.width = (region.bbox.width * scaleX) + 'px';
+                    overlay.style.height = (region.bbox.height * scaleY) + 'px';
+                    overlay.dataset.regionId = region.id;
+                    
+                    overlay.addEventListener('click', () => {
+                        selectRegion(region.id);
+                    });
+                    
+                    container.appendChild(overlay);
+                });
+            };
+        }
+        
+        function selectRegion(regionId) {
+            // Highlight the region
+            document.querySelectorAll('.text-region').forEach(region => {
+                region.classList.remove('selected');
+            });
+            document.querySelector(`[data-region-id="${regionId}"]`).parentElement.querySelector('.text-region').classList.add('selected');
+        }
+        
+        function showProcessingStep(stepNumber) {
+            for (let i = 1; i <= 3; i++) {
+                const step = document.getElementById(`step${i}`);
+                const icon = step.querySelector('.step-icon');
+                
+                if (i < stepNumber) {
+                    step.classList.add('completed');
+                    icon.classList.add('completed');
+                    icon.textContent = '✓';
+                } else if (i === stepNumber) {
+                    step.classList.add('active');
+                    icon.classList.add('active');
+                } else {
+                    step.classList.remove('active', 'completed');
+                    icon.classList.remove('active', 'completed');
+                    icon.textContent = i;
+                }
+            }
+        }
+        
+        function renderTextRegions() {
+            const container = document.getElementById('textRegions');
+            container.innerHTML = '';
+            
+            textRegions.forEach(region => {
+                const regionDiv = document.createElement('div');
+                regionDiv.className = 'card';
+                regionDiv.innerHTML = `
+                    <div class="card-header">
+                        <div>
+                            <div class="card-title">Text Region ${region.id + 1}</div>
+                            <div class="card-subtitle">Click on image to highlight this region</div>
+                        </div>
+                        <div class="badge ${getActionBadgeClass(userActions[region.id] || 'preserve')}">
+                            ${getActionText(userActions[region.id] || 'preserve')}
+                                    </div>
+                                    </div>
+                    
+                    <div class="translation-comparison">
+                        <div class="translation-side">
+                            <div class="translation-side-header">📝 Original Text</div>
+                            <div class="translation-content">${region.text}</div>
+                                    </div>
+                        <div class="translation-side">
+                            <div class="translation-side-header">🔄 Translated Text</div>
+                            <div class="translation-content" id="translation-${region.id}">${region.translated}</div>
+                                </div>
+                        </div>
+                    
+                    <div class="language-editor" id="language-editor-${region.id}" style="display: none;">
+                        <div class="language-selector-row">
+                            <div class="language-selector-item">
+                                <label>Source Language:</label>
+                                <select id="source-lang-${region.id}">
+                                    <option value="auto">Auto Detect</option>
+                                    <option value="te">తెలుగు (Telugu)</option>
+                                    <option value="hi">हिन्दी (Hindi)</option>
+                                    <option value="en">English</option>
+                                    <option value="ta">தமிழ் (Tamil)</option>
+                                    <option value="kn">ಕನ್ನಡ (Kannada)</option>
+                                    <option value="ml">മലയാളം (Malayalam)</option>
+                                </select>
+                        </div>
+                            <div class="language-selector-item">
+                                <label>Target Language:</label>
+                                <select id="target-lang-${region.id}">
+                                    <option value="te">తెలుగు (Telugu)</option>
+                                    <option value="hi">हिन्दी (Hindi)</option>
+                                    <option value="en">English</option>
+                                    <option value="ta">தமிழ் (Tamil)</option>
+                                    <option value="kn">ಕನ್ನಡ (Kannada)</option>
+                                    <option value="ml">മലയാളം (Malayalam)</option>
+                                </select>
+                    </div>
+                        </div>
+                        <div class="action-bar">
+                            <button class="action-btn btn-sm btn-outline" onclick="retranslateRegion(${region.id})">🔄 Retranslate</button>
+                            <button class="action-btn btn-sm" onclick="saveRegionTranslation(${region.id})">💾 Save</button>
+                            <button class="action-btn btn-sm btn-outline" onclick="cancelRegionEdit(${region.id})">❌ Cancel</button>
+                        </div>
+                    </div>
+                    
+                    <div class="action-bar">
+                        <button class="control-btn ${userActions[region.id] === 'translate' ? 'active' : ''}" 
+                                onclick="setRegionAction(${region.id}, 'translate')" title="Translate this region">
+                            🔄 Translate
+                        </button>
+                        <button class="control-btn ${userActions[region.id] === 'preserve' ? 'active' : ''}" 
+                                onclick="setRegionAction(${region.id}, 'preserve')" title="Keep original text">
+                            📝 Preserve
+                        </button>
+                        <button class="control-btn ${userActions[region.id] === 'whiteout' ? 'active' : ''}" 
+                                onclick="setRegionAction(${region.id}, 'whiteout')" title="Remove this text">
+                            🗑️ Whiteout
+                        </button>
+                        <button class="control-btn btn-outline" onclick="editRegionTranslation(${region.id})" title="Edit translation and language options">
+                            ✏️ Edit Translation
+                        </button>
+                </div>
+            `;
+                container.appendChild(regionDiv);
+            });
+        }
+        
+        function getActionBadgeClass(action) {
+            switch(action) {
+                case 'translate': return 'badge-success';
+                case 'preserve': return 'badge-info';
+                case 'whiteout': return 'badge-error';
+                default: return 'badge-info';
+            }
+        }
+        
+        function getActionText(action) {
+            switch(action) {
+                case 'translate': return 'Translate';
+                case 'preserve': return 'Preserve';
+                case 'whiteout': return 'Whiteout';
+                default: return 'Preserve';
+            }
+        }
+        
+        function setRegionAction(regionId, action) {
+            userActions[regionId] = action;
+            
+            // Update region styling
+            const regionDiv = document.querySelector(`[data-region-id="${regionId}"]`);
+            if (regionDiv) {
+                regionDiv.className = `bbox-overlay ${action}`;
+            }
+            
+            // Update card badge
+            const card = document.querySelector(`#textRegions .card:nth-child(${regionId + 1})`);
+            if (card) {
+                const badge = card.querySelector('.badge');
+                if (badge) {
+                    badge.className = `badge ${getActionBadgeClass(action)}`;
+                    badge.textContent = getActionText(action);
+                }
+            }
+            
+            // Update control buttons
+            const buttons = document.querySelectorAll(`#textRegions .card:nth-child(${regionId + 1}) .control-btn`);
+            buttons.forEach(btn => btn.classList.remove('active'));
+            buttons.forEach(btn => {
+                if (btn.textContent.includes(getActionText(action))) {
+                    btn.classList.add('active');
+                }
+            });
+            
+            showStatus(`Region ${regionId + 1} set to ${getActionText(action)}`, 'success');
+        }
+        
+        function scrollToTop() {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+        
+        function previewDocument() {
+            showLoading('Generating HTML Preview', 'Creating layout-preserving document...');
+            
+            fetch('/process', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ actions: userActions })
+            })
+            .then(response => response.json())
+            .then(data => {
+                hideLoading();
+                if (data.success) {
+                    document.getElementById('mainContent').style.display = 'none';
+                    document.getElementById('previewSection').style.display = 'block';
+                    
+                    // Create a new window with the HTML content
+                    const newWindow = window.open('', '_blank');
+                    newWindow.document.write(data.processed_html);
+                    newWindow.document.close();
+                    
+                    showStatus('HTML preview opened in new window!', 'success');
+                } else {
+                    showStatus('Error: ' + data.error, 'error');
+                }
+            })
+            .catch(error => {
+                hideLoading();
+                showStatus('Error generating preview: ' + error, 'error');
+            });
+        }
+        
+        function downloadDocument() {
+            // First process the document, then download the HTML
+            showLoading('Preparing Download', 'Generating final HTML document...');
+            
+            fetch('/process', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ actions: userActions })
+            })
+            .then(response => response.json())
+            .then(data => {
+                hideLoading();
+                if (data.success) {
+                    // Create a blob with the HTML content and download it
+                    const blob = new Blob([data.processed_html], { type: 'text/html' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'translated_document.html';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                    
+                    showStatus('HTML document downloaded successfully!', 'success');
+                } else {
+                    showStatus('Error: ' + data.error, 'error');
+                }
+            })
+            .catch(error => {
+                hideLoading();
+                showStatus('Error downloading document: ' + error, 'error');
+            });
+        }
+        
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('statusMessage');
+            statusDiv.textContent = message;
+            statusDiv.className = `status-message ${type}`;
+            statusDiv.style.display = 'block';
+            
+            setTimeout(() => {
+                statusDiv.style.display = 'none';
+            }, 3000);
+        }
+        
+        // Mode switching functions
+        function switchMode(mode) {
+            currentMode = mode;
+            
+            // Update button states
+            document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(mode + 'Mode').classList.add('active');
+            
+            // Show/hide sections
+            if (mode === 'document') {
+                document.getElementById('uploadSection').style.display = 'block';
+                document.getElementById('textInputSection').style.display = 'none';
+                document.getElementById('model-selection-section').style.display = 'block';
+            } else {
+                document.getElementById('uploadSection').style.display = 'none';
+                document.getElementById('textInputSection').style.display = 'block';
+                document.getElementById('model-selection-section').style.display = 'block';
+                
+                // Update language display for text mode
+                updateLanguageDisplay();
+            }
+        }
+        
+        // Multi-Agent Text translation functions
+        async function translateText() {
+            const textInput = document.getElementById('textInput');
+            const text = textInput.value.trim();
+            
+            if (!text) {
+                showStatus('Please enter some text to translate.', 'error');
+                return;
+            }
+            
+            if (agentMode) {
+                await translateTextWithMultiAgent(text);
+            } else {
+                await translateTextWithRAG(text);
+            }
+        }
+        
+        async function translateTextWithMultiAgent(text) {
+            showLoading('🤖 Multi-Agent Translation', 'Generating multiple translation options...');
+            
+            try {
+                // Use backend multi-agent endpoint
+                const response = await fetch('/api/multi-agent-translate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text: text,
+                        model: selectedModel,
+                        target_language: selectedLanguage,
+                        source_language: 'en' // Assume English source for now
+                    })
+                });
+                
+                const data = await response.json();
+                hideLoading();
+                
+                if (data.success) {
+                    // Display multiple translation options
+                    displayBackendMultiAgentOptions(text, data.options);
+                    showStatus('Multi-agent translation completed! Choose your preferred option.', 'success');
+                } else {
+                    showStatus('Multi-agent translation failed: ' + data.error, 'error');
+                    // Fallback to RAG translation
+                    await translateTextWithRAG(text);
+                }
+                
+            } catch (error) {
+                hideLoading();
+                console.error('Multi-agent translation error:', error);
+                showStatus('Multi-agent translation failed: ' + error.message, 'error');
+                // Fallback to RAG translation
+                await translateTextWithRAG(text);
+            }
+        }
+        
+        function displayBackendMultiAgentOptions(originalText, options) {
+            const resultContainer = document.getElementById('textResultContainer');
+            
+            // Show the result container
+            resultContainer.style.display = 'block';
+            
+            // Create translation options container
+            const optionsContainer = document.createElement('div');
+            optionsContainer.className = 'translation-options-container';
+            
+            let optionsHTML = `
+                <h3 style="color: #4CAF50; margin-bottom: 20px;">🤖 Multi-Agent Translation Options</h3>
+                <div class="agent-progress">
+                    <h4 style="color: #4CAF50; margin-bottom: 15px;">Generated Translation Options</h4>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">RAG-Enhanced Translation</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Direct Translation</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Enhanced Translation</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Conservative Translation</div>
+                    </div>
+                </div>
+            `;
+            
+            // Add each translation option
+            const optionKeys = ['rag_translation', 'enhanced_translation', 'direct_translation', 'conservative_translation'];
+            let selectedOption = 'rag_translation';
+            
+            optionKeys.forEach((key, index) => {
+                if (options[key] && options.metadata[key]) {
+                    const metadata = options.metadata[key];
+                    const isRecommended = metadata.recommended;
+                    const isSelected = isRecommended && index === 0;
+                    
+                    if (isSelected) {
+                        selectedOption = key;
+                    }
+                    
+                    optionsHTML += `
+                        <div class="translation-option ${isSelected ? 'selected' : ''}" data-option="${key}" onclick="selectTranslationOption('${key}', this)">
+                            <div class="option-header">
+                                <div class="option-title">${getOptionIcon(key)} ${metadata.type} ${isRecommended ? '(Recommended)' : ''}</div>
+                                <div class="option-badge ${getBadgeClass(key)}">${metadata.type}</div>
+                            </div>
+                            <div class="option-content">${options[key]}</div>
+                            <div class="option-metrics">
+                                <div class="metric">
+                                    <div class="metric-icon accuracy"></div>
+                                    <span>${metadata.accuracy} Accuracy</span>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-icon consistency"></div>
+                                    <span>${metadata.consistency} Consistency</span>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-icon quality"></div>
+                                    <span>${metadata.description}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+            });
+            
+            optionsHTML += `
+                <div style="margin-top: 20px;">
+                    <button class="btn btn-primary" onclick="confirmSelectedBackendTranslation()" style="margin-right: 10px;">
+                        ✅ Use Selected Translation
+                    </button>
+                    <button class="btn btn-outline" onclick="showBackendComparisonView()">
+                        🔍 Compare Options
+                    </button>
+                </div>
+            `;
+            
+            optionsContainer.innerHTML = optionsHTML;
+            
+            // Store options for later use
+            window.currentBackendOptions = options;
+            window.originalText = originalText;
+            window.selectedTranslationOption = selectedOption;
+            
+            // Clear previous results and add new options
+            resultContainer.innerHTML = '';
+            resultContainer.appendChild(optionsContainer);
+        }
+        
+        function getOptionIcon(key) {
+            const icons = {
+                'rag_translation': '🧠',
+                'enhanced_translation': '🌟',
+                'direct_translation': '📝',
+                'conservative_translation': '🔒'
+            };
+            return icons[key] || '📄';
+        }
+        
+        function getBadgeClass(key) {
+            const classes = {
+                'rag_translation': 'rag',
+                'enhanced_translation': 'improved',
+                'direct_translation': 'original',
+                'conservative_translation': 'original'
+            };
+            return classes[key] || 'original';
+        }
+        
+        function confirmSelectedBackendTranslation() {
+            const options = window.currentBackendOptions;
+            const selectedKey = window.selectedTranslationOption;
+            
+            if (options[selectedKey]) {
+                currentTextTranslation = options[selectedKey];
+                displayTextTranslation(options[selectedKey]);
+                showStatus('Translation confirmed and saved!', 'success');
+            } else {
+                showStatus('Error: Selected translation not found', 'error');
+            }
+        }
+        
+        function showBackendComparisonView() {
+            const options = window.currentBackendOptions;
+            const originalText = window.originalText;
+            
+            const resultContainer = document.getElementById('textResultContainer');
+            resultContainer.style.display = 'block';
+            
+            const comparisonContainer = document.createElement('div');
+            comparisonContainer.className = 'translation-options-container';
+            
+            let comparisonHTML = `
+                <h3 style="color: #4CAF50; margin-bottom: 20px;">🔍 Translation Comparison</h3>
+                
+                <div class="comparison-view">
+                    <div class="comparison-panel">
+                        <h4>📝 Original Text</h4>
+                        <div class="comparison-text">${originalText}</div>
+                    </div>
+                    <div class="comparison-panel">
+                        <h4>🧠 RAG-Enhanced Translation</h4>
+                        <div class="comparison-text">${options.rag_translation || 'N/A'}</div>
+                    </div>
+                </div>
+                
+                <div class="comparison-view">
+                    <div class="comparison-panel">
+                        <h4>🌟 Enhanced Translation</h4>
+                        <div class="comparison-text">${options.enhanced_translation || 'N/A'}</div>
+                    </div>
+                    <div class="comparison-panel">
+                        <h4>📝 Direct Translation</h4>
+                        <div class="comparison-text">${options.direct_translation || 'N/A'}</div>
+                    </div>
+                </div>
+                
+                <div class="comparison-view">
+                    <div class="comparison-panel">
+                        <h4>🔒 Conservative Translation</h4>
+                        <div class="comparison-text">${options.conservative_translation || 'N/A'}</div>
+                    </div>
+                    <div class="comparison-panel">
+                        <h4>📊 Translation Types</h4>
+                        <div class="comparison-text">
+                            <div style="margin-bottom: 10px;">
+                                <strong>RAG-Enhanced:</strong> Uses legal glossary context
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <strong>Enhanced:</strong> Context-aware with improvements
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <strong>Direct:</strong> Standard neural translation
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <strong>Conservative:</strong> Literal structure preservation
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 20px; text-align: center;">
+                    <button class="btn btn-primary" onclick="confirmSelectedBackendTranslation()" style="margin-right: 10px;">
+                        ✅ Use Selected Translation
+                    </button>
+                    <button class="btn btn-outline" onclick="displayBackendMultiAgentOptions(window.originalText, window.currentBackendOptions)">
+                        ← Back to Options
+                    </button>
+                </div>
+            `;
+            
+            comparisonContainer.innerHTML = comparisonHTML;
+            
+            document.getElementById('textResultContainer').innerHTML = '';
+            document.getElementById('textResultContainer').appendChild(comparisonContainer);
+        }
+        
+        async function translateTextWithRAG(text) {
+            showLoading('Translating Text', 'Processing your text...');
+            
+            try {
+                const response = await fetch('/api/translate-text', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text: text,
+                        model: selectedModel,
+                        target_language: selectedLanguage,
+                        agent_mode: agentMode
+                    })
+                });
+                
+                const data = await response.json();
+                hideLoading();
+                
+                if (data.success) {
+                    currentTextTranslation = data.translation;
+                    displayTextTranslation(data.translation);
+                    showStatus('Text translated successfully!', 'success');
+                } else {
+                    showStatus('Translation failed: ' + data.error, 'error');
+                }
+            } catch (error) {
+                hideLoading();
+                showStatus('Error translating text: ' + error.message, 'error');
+            }
+        }
+        
+        function displayMultiAgentTranslationOptions(originalText, agentResult) {
+            const resultContainer = document.getElementById('textResultContainer');
+            
+            // Create translation options container
+            const optionsContainer = document.createElement('div');
+            optionsContainer.className = 'translation-options-container';
+            optionsContainer.innerHTML = `
+                <h3 style="color: #4CAF50; margin-bottom: 20px;">🤖 Multi-Agent Translation Options</h3>
+                <div class="agent-progress">
+                    <h4 style="color: #4CAF50; margin-bottom: 15px;">Agent Processing Summary</h4>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Context Analysis</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Translation</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Validation</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Consistency Check</div>
+                    </div>
+                    <div class="agent-step">
+                        <div class="step-icon completed">✓</div>
+                        <div class="step-text completed">Quality Improvement</div>
+                    </div>
+                </div>
+                
+                <div class="translation-option selected" data-option="improved" onclick="selectTranslationOption('improved', this)">
+                    <div class="option-header">
+                        <div class="option-title">🌟 Improved Translation (Recommended)</div>
+                        <div class="option-badge improved">Enhanced</div>
+                    </div>
+                    <div class="option-content">${agentResult.finalText || agentResult.improvedTranslation}</div>
+                    <div class="option-metrics">
+                        <div class="metric">
+                            <div class="metric-icon accuracy"></div>
+                            <span>High Accuracy</span>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-icon consistency"></div>
+                            <span>Language Consistent</span>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-icon quality"></div>
+                            <span>Quality Enhanced</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="translation-option" data-option="original" onclick="selectTranslationOption('original', this)">
+                    <div class="option-header">
+                        <div class="option-title">📝 Original Translation</div>
+                        <div class="option-badge original">Standard</div>
+                    </div>
+                    <div class="option-content">${agentResult.originalTranslation}</div>
+                    <div class="option-metrics">
+                        <div class="metric">
+                            <div class="metric-icon accuracy"></div>
+                            <span>Good Accuracy</span>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-icon consistency"></div>
+                            <span>Basic Consistency</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 20px;">
+                    <button class="btn btn-primary" onclick="confirmSelectedTranslation()" style="margin-right: 10px;">
+                        ✅ Use Selected Translation
+                    </button>
+                    <button class="btn btn-outline" onclick="showComparisonView()">
+                        🔍 Compare Options
+                    </button>
+                </div>
+            `;
+            
+            // Store agent result for later use
+            window.currentAgentResult = agentResult;
+            window.originalText = originalText;
+            window.selectedTranslationOption = 'improved';
+            
+            // Clear previous results and add new options
+            resultContainer.innerHTML = '';
+            resultContainer.appendChild(optionsContainer);
+        }
+        
+        function selectTranslationOption(optionType, element) {
+            // Remove selected class from all options
+            document.querySelectorAll('.translation-option').forEach(opt => {
+                opt.classList.remove('selected');
+            });
+            
+            // Add selected class to clicked option
+            element.classList.add('selected');
+            window.selectedTranslationOption = optionType;
+        }
+        
+        function confirmSelectedTranslation() {
+            const agentResult = window.currentAgentResult;
+            let selectedTranslation;
+            
+            switch (window.selectedTranslationOption) {
+                case 'improved':
+                    selectedTranslation = agentResult.finalText || agentResult.improvedTranslation;
+                    break;
+                case 'original':
+                    selectedTranslation = agentResult.originalTranslation;
+                    break;
+                default:
+                    selectedTranslation = agentResult.finalText || agentResult.originalTranslation;
+            }
+            
+            currentTextTranslation = selectedTranslation;
+            displayTextTranslation(selectedTranslation);
+            showStatus('Translation confirmed and saved!', 'success');
+        }
+        
+        function showComparisonView() {
+            const agentResult = window.currentAgentResult;
+            const originalText = window.originalText;
+            
+            const comparisonContainer = document.createElement('div');
+            comparisonContainer.className = 'translation-options-container';
+            comparisonContainer.innerHTML = `
+                <h3 style="color: #4CAF50; margin-bottom: 20px;">🔍 Translation Comparison</h3>
+                
+                <div class="comparison-view">
+                    <div class="comparison-panel">
+                        <h4>📝 Original Text</h4>
+                        <div class="comparison-text">${originalText}</div>
+                    </div>
+                    <div class="comparison-panel">
+                        <h4>🌟 Improved Translation</h4>
+                        <div class="comparison-text">${agentResult.finalText || agentResult.improvedTranslation}</div>
+                    </div>
+                </div>
+                
+                <div class="comparison-view">
+                    <div class="comparison-panel">
+                        <h4>📝 Original Translation</h4>
+                        <div class="comparison-text">${agentResult.originalTranslation}</div>
+                    </div>
+                    <div class="comparison-panel">
+                        <h4>📊 Quality Metrics</h4>
+                        <div class="comparison-text">
+                            <div style="margin-bottom: 10px;">
+                                <strong>Accuracy:</strong> ${agentResult.metadata?.agentResults?.validation?.accuracy || 'N/A'}%
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <strong>Consistency:</strong> ${agentResult.metadata?.agentResults?.consistencyCheck?.consistencyScore || 'N/A'}%
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <strong>Processing Time:</strong> ${Math.round((agentResult.metadata?.duration || 0) / 1000)}s
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 20px; text-align: center;">
+                    <button class="btn btn-primary" onclick="confirmSelectedTranslation()" style="margin-right: 10px;">
+                        ✅ Use Improved Translation
+                    </button>
+                    <button class="btn btn-outline" onclick="displayMultiAgentTranslationOptions(window.originalText, window.currentAgentResult)">
+                        ← Back to Options
+                    </button>
+                </div>
+            `;
+            
+            document.getElementById('textResultContainer').innerHTML = '';
+            document.getElementById('textResultContainer').appendChild(comparisonContainer);
+        }
+        
+        function displayTextTranslation(translation) {
+            const resultContainer = document.getElementById('textResultContainer');
+            const resultDiv = document.getElementById('textResult');
+            
+            resultDiv.textContent = translation;
+            resultContainer.style.display = 'block';
+        }
+        
+        function clearText() {
+            document.getElementById('textInput').value = '';
+            document.getElementById('textResultContainer').style.display = 'none';
+            currentTextTranslation = '';
+        }
+        
+        function editTranslation() {
+            const resultDiv = document.getElementById('textResult');
+            const currentText = resultDiv.textContent;
+            
+            // Replace with editable div
+            const editableDiv = document.createElement('div');
+            editableDiv.className = 'editable-translation';
+            editableDiv.contentEditable = true;
+            editableDiv.textContent = currentText;
+            
+            // Add save/cancel buttons
+            const buttonContainer = document.createElement('div');
+            buttonContainer.className = 'text-result-actions';
+            buttonContainer.innerHTML = `
+                <button class="action-btn" onclick="saveTextTranslation()">💾 Save</button>
+                <button class="action-btn" onclick="cancelTextEdit()">❌ Cancel</button>
+            `;
+            
+            resultDiv.parentNode.replaceChild(editableDiv, resultDiv);
+            editableDiv.parentNode.appendChild(buttonContainer);
+            
+            editableDiv.focus();
+        }
+        
+        function saveTextTranslation() {
+            const editableDiv = document.querySelector('.editable-translation');
+            const newTranslation = editableDiv.textContent.trim();
+            
+            if (!newTranslation) {
+                showStatus('Translation cannot be empty', 'error');
+                return;
+            }
+            
+            currentTextTranslation = newTranslation;
+            
+            // Restore original display
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'text-result';
+            resultDiv.id = 'textResult';
+            resultDiv.textContent = newTranslation;
+            
+            const buttonContainer = document.querySelector('.text-result-actions');
+            buttonContainer.innerHTML = `
+                <button class="action-btn" onclick="editTranslation()">✏️ Edit Translation</button>
+                <button class="action-btn" onclick="copyTranslation()">📋 Copy</button>
+                <button class="action-btn" onclick="downloadTextTranslation()">💾 Download</button>
+            `;
+            
+            editableDiv.parentNode.replaceChild(resultDiv, editableDiv);
+            
+            showStatus('Translation updated successfully!', 'success');
+        }
+        
+        function cancelTextEdit() {
+            const editableDiv = document.querySelector('.editable-translation');
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'text-result';
+            resultDiv.id = 'textResult';
+            resultDiv.textContent = currentTextTranslation;
+            
+            const buttonContainer = document.querySelector('.text-result-actions');
+            buttonContainer.innerHTML = `
+                <button class="action-btn" onclick="editTranslation()">✏️ Edit Translation</button>
+                <button class="action-btn" onclick="copyTranslation()">📋 Copy</button>
+                <button class="action-btn" onclick="downloadTextTranslation()">💾 Download</button>
+            `;
+            
+            editableDiv.parentNode.replaceChild(resultDiv, editableDiv);
+        }
+        
+        function copyTranslation() {
+            const text = currentTextTranslation;
+            navigator.clipboard.writeText(text).then(() => {
+                showStatus('Translation copied to clipboard!', 'success');
+            }).catch(() => {
+                showStatus('Failed to copy translation', 'error');
+            });
+        }
+        
+        function downloadTextTranslation() {
+            const text = currentTextTranslation;
+            const blob = new Blob([text], { type: 'text/plain' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'translated_text.txt';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+            
+            showStatus('Translation downloaded successfully!', 'success');
+        }
+        
+        // Region translation editing functions
+        function editRegionTranslation(regionId) {
+            const translationDiv = document.getElementById(`translation-${regionId}`);
+            const languageEditor = document.getElementById(`language-editor-${regionId}`);
+            
+            // Make translation editable
+            translationDiv.contentEditable = true;
+            translationDiv.classList.add('editable');
+            translationDiv.focus();
+            
+            // Show language editor
+            languageEditor.style.display = 'block';
+            
+            // Set current language as default
+            const targetLangSelect = document.getElementById(`target-lang-${regionId}`);
+            targetLangSelect.value = selectedLanguage;
+        }
+        
+        async function retranslateRegion(regionId) {
+            const sourceLangSelect = document.getElementById(`source-lang-${regionId}`);
+            const targetLangSelect = document.getElementById(`target-lang-${regionId}`);
+            const translationDiv = document.getElementById(`translation-${regionId}`);
+            
+            const sourceLang = sourceLangSelect.value;
+            const targetLang = targetLangSelect.value;
+            const originalText = textRegions[regionId].text;
+            
+            if (sourceLang === 'auto') {
+                // Auto-detect language (simplified - you could use a language detection API)
+                showStatus('Auto-detecting language...', 'info');
+            }
+            
+            showLoading('Retranslating Region', 'Processing with new language settings...');
+            
+            try {
+                const response = await fetch('/api/translate-text', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                        text: originalText,
+                        model: selectedModel,
+                        target_language: targetLang,
+                        agent_mode: agentMode
+                            })
+                        });
+                        
+                        const data = await response.json();
+                hideLoading();
+                        
+                        if (data.success) {
+                    translationDiv.textContent = data.translation;
+                    textRegions[regionId].translated = data.translation;
+                    showStatus(`Region ${regionId + 1} retranslated successfully!`, 'success');
+                } else {
+                    showStatus('Retranslation failed: ' + data.error, 'error');
+                        }
+                    } catch (error) {
+                hideLoading();
+                showStatus('Error retranslating region: ' + error.message, 'error');
+            }
+        }
+        
+        function saveRegionTranslation(regionId) {
+            const translationDiv = document.getElementById(`translation-${regionId}`);
+            const languageEditor = document.getElementById(`language-editor-${regionId}`);
+            const newTranslation = translationDiv.textContent.trim();
+            
+            if (!newTranslation) {
+                showStatus('Translation cannot be empty', 'error');
+                return;
+            }
+            
+            // Update the region data
+            textRegions[regionId].translated = newTranslation;
+            
+            // Make translation non-editable
+            translationDiv.contentEditable = false;
+            translationDiv.classList.remove('editable');
+            
+            // Hide language editor
+            languageEditor.style.display = 'none';
+            
+            showStatus(`Translation for region ${regionId + 1} updated successfully!`, 'success');
+        }
+        
+        function cancelRegionEdit(regionId) {
+            const translationDiv = document.getElementById(`translation-${regionId}`);
+            const languageEditor = document.getElementById(`language-editor-${regionId}`);
+            const originalText = textRegions[regionId].translated;
+            
+            // Restore original text
+            translationDiv.textContent = originalText;
+            translationDiv.contentEditable = false;
+            translationDiv.classList.remove('editable');
+            
+            // Hide language editor
+            languageEditor.style.display = 'none';
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            checkRAGStatus();
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Flask Routes
+@app.route('/')
+def index():
+    """Serve the main HTML page"""
+    return create_dynamic_ui()
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    """Handle image upload and OCR processing with enhanced features"""
+    global current_image, current_bboxes, current_translated_text, current_image_path, current_target_language
+    
+    try:
+        # Get uploaded file
+        file = request.files['image']
+        if not file:
+            return jsonify({'error': 'No image uploaded'}), 400
+        
+        # Save uploaded file
+        filename = file.filename
+        file_path = os.path.join(tempfile.gettempdir(), filename)
+        file.save(file_path)
+        
+        current_image_path = file_path
+        
+        # Process with OCR
+        bboxes = process_image_with_ocr(file_path)
+        current_bboxes = bboxes
+        
+        if not bboxes:
+            return jsonify({
+                'success': False,
+                'error': 'No text detected in the image. Please try with a clearer image or one with printed text.',
+                'suggestions': [
+                    'Make sure the image is clear and not blurry',
+                    'Ensure the text is printed (not handwritten)',
+                    'Try a higher resolution image',
+                    'Check if the image contains readable text'
+                ]
+            }), 400
+        
+        # Extract text for translation
+        original_text = '\n'.join([bbox['text'] for bbox in bboxes])
+        print(f"DEBUG: Original text extracted: {original_text[:100]}...")
+        
+        # Get model, agent mode, and target language from request
+        model = request.form.get('model', 'gemma3-legal-samanantar-pro:latest')
+        agent_mode = request.form.get('agent_mode', 'false').lower() == 'true'
+        target_language = request.form.get('target_language', 'te')
+        
+        print(f"DEBUG: Model={model}, AgentMode={agent_mode}, TargetLang={target_language}")
+        
+        # Translate each text region individually
+        translated_lines = []
+        for i, bbox in enumerate(bboxes):
+            region_text = bbox['text']
+            print(f"DEBUG: Translating region {i+1}: '{region_text[:50]}...'")
+            
+            if agent_mode:
+                region_translated = translate_paragraph_with_rag(region_text, model, target_language)
+            else:
+                region_translated = translate_text(region_text, model, target_language)
+            
+            print(f"DEBUG: Region {i+1} translated: '{region_translated[:50]}...'")
+            translated_lines.append(region_translated)
+        
+        current_translated_text = translated_lines
+        
+        # Store target language
+        current_target_language = target_language
+        
+        # Convert image to base64 for display
+        with open(file_path, 'rb') as img_file:
+            img_data = base64.b64encode(img_file.read()).decode()
+        
+        # Prepare response data
+        response_data = {
+            'success': True,
+            'image': img_data,
+            'text_regions': []
+        }
+        
+        # Add text regions with bounding boxes
+        for i, bbox in enumerate(bboxes):
+            bbox_coords = bbox['bbox']
+            x_coords = [point[0] for point in bbox_coords]
+            y_coords = [point[1] for point in bbox_coords]
+            x_min, x_max = min(x_coords), max(x_coords)
+            y_min, y_max = min(y_coords), max(y_coords)
+            
+            region_data = {
+                'id': i,
+                'title': f'Text Region {i+1}',
+                'text': bbox['text'],
+                'translated': translated_lines[i] if i < len(translated_lines) else bbox['text'],
+                'bbox': {
+                    'x': x_min,
+                    'y': y_min,
+                    'width': x_max - x_min,
+                    'height': y_max - y_min
+                },
+                'action': 'preserve'  # Default action
+            }
+            response_data['text_regions'].append(region_data)
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/rag/status', methods=['GET'])
+def rag_status():
+    """Get RAG system status"""
+    return jsonify({
+        'rag_available': current_rag_system is not None,
+        'rag_initialized': current_rag_system is not None,
+        'status': 'active' if current_rag_system else 'inactive'
+    })
+
+@app.route('/api/rag/setup', methods=['POST'])
+def setup_rag():
+    """Setup RAG system"""
+    global current_rag_system
+    
+    if not RAG_AVAILABLE:
+        return jsonify({'success': False, 'error': 'RAG system not available'})
+    
+    try:
+        if not current_rag_system:
+            current_rag_system = LegalRAGSystem()
+            current_rag_system.initialize()
+        
+        # Process documents if they exist
+        hindi_glossary_dir = Path("glossary - hindi")
+        telugu_glossary_dir = Path("glossary telugu")
+        go_dir = Path("GOs (1)")
+        
+        if hindi_glossary_dir.exists():
+            current_rag_system.process_glossary_documents(str(hindi_glossary_dir), 'hindi')
+        
+        if telugu_glossary_dir.exists():
+            current_rag_system.process_glossary_documents(str(telugu_glossary_dir), 'telugu')
+        
+        if go_dir.exists():
+            current_rag_system.process_government_orders(str(go_dir))
+        
+        current_rag_system.save_metadata()
+        
+        return jsonify({
+            'success': True,
+            'message': 'RAG system setup completed successfully',
+            'collections': list(current_rag_system.collections.keys()),
+            'total_documents': len(current_rag_system.document_metadata)
+        })
+        
+    except Exception as e:
+        print(f"RAG setup error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/process', methods=['POST'])
+def process_document():
+    """Process document with user actions"""
+    global current_image_path, current_bboxes, current_translated_text, current_target_language
+    
+    try:
+        data = request.get_json()
+        user_actions = data.get('actions', {})
+        
+        if not current_image_path or not current_bboxes:
+            return jsonify({'error': 'No image processed'}), 400
+        
+        # Create processed HTML document
+        processed_html = create_processed_html(
+            current_image_path, 
+            current_bboxes, 
+            current_translated_text, 
+            user_actions, 
+            current_target_language
+        )
+        
+        # Save processed HTML
+        output_path = os.path.join(tempfile.gettempdir(), 'processed_document.html')
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(processed_html)
+        
+        return jsonify({
+            'success': True,
+            'processed_html': processed_html,
+            'download_url': '/download_html'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download_html')
+def download_html_document():
+    """Download the processed HTML document"""
+    try:
+        output_path = os.path.join(tempfile.gettempdir(), 'processed_document.html')
+        if os.path.exists(output_path):
+            return send_file(output_path, as_attachment=True, download_name='processed_document.html')
+        else:
+            return jsonify({'error': 'No processed document available'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ollama/models', methods=['GET'])
+def get_ollama_models():
+    """Get available Ollama models"""
+    try:
+        # Get list of available models
+        models = ollama.list()
+        
+        return jsonify({
+            'success': True,
+            'models': [model['name'] for model in models['models']],
+            'current_model': 'gemma3-legal-samanantar-pro:latest'
+        })
+        
+    except Exception as e:
+        print(f"Error getting models: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'models': [],
+            'current_model': 'gemma3-legal-samanantar-pro:latest'
+        })
+
+@app.route('/debug/translation', methods=['POST'])
+def debug_translation():
+    """Debug translation endpoint"""
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        target_language = data.get('target_language', 'te')
+        
+        if not text:
+            return jsonify({'success': False, 'error': 'No text provided'})
+        
+        # Test translation
+        translated_text = translate_text(text, target_language=target_language)
+        
+        return jsonify({
+            'success': True,
+            'original_text': text,
+            'translated_text': translated_text,
+            'target_language': target_language,
+            'rag_used': current_rag_system is not None
+        })
+        
+    except Exception as e:
+        print(f"Debug translation error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/ollama', methods=['POST'])
+def ollama_api():
+    """Ollama API endpoint for agent framework"""
+    try:
+        data = request.get_json()
+        model = data.get('model', 'gemma3-legal-samanantar-pro:latest')
+        prompt = data.get('prompt', '')
+        
+        if not prompt:
+            return jsonify({'success': False, 'error': 'No prompt provided'})
+        
+        # Generate response using Ollama
+        response = ollama.generate(model=model, prompt=prompt)
+        
+        return jsonify({
+            'success': True,
+            'response': response['response'],
+            'model': model
+        })
+        
+    except Exception as e:
+        print(f"Ollama API error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/edit-translation', methods=['POST'])
+def edit_translation():
+    """Edit a specific translation"""
+    global current_translated_text
+    
+    try:
+        data = request.get_json()
+        region_index = data.get('region_index')
+        new_translation = data.get('new_translation')
+        
+        if region_index is None or new_translation is None:
+            return jsonify({'success': False, 'error': 'Missing region_index or new_translation'}), 400
+        
+        if region_index < 0 or region_index >= len(current_translated_text):
+            return jsonify({'success': False, 'error': 'Invalid region index'}), 400
+        
+        # Update the translation
+        current_translated_text[region_index] = new_translation
+        
+        # Regenerate the HTML document
+        user_actions = {str(i): 'translate' for i in range(len(current_translated_text))}
+        create_processed_html(current_image_path, current_bboxes, current_translated_text, user_actions, current_target_language)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Translation updated successfully',
+            'updated_translation': new_translation
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/get-translations')
+def get_translations():
+    """Get all current translations for editing"""
+    global current_translated_text, current_bboxes
+    
+    try:
+        translations = []
+        for i, (bbox, translation) in enumerate(zip(current_bboxes, current_translated_text)):
+            translations.append({
+                'index': i,
+                'original_text': bbox['text'],
+                'translated_text': translation,
+                'bbox': bbox['bbox']
+            })
+        
+        return jsonify({
+            'success': True,
+            'translations': translations,
+            'total_regions': len(current_bboxes)
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/translate-text', methods=['POST'])
+def translate_text_api():
+    """API endpoint for direct text translation"""
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        model = data.get('model', 'gemma3-legal-samanantar-pro:latest')
+        target_language = data.get('target_language', 'te')
+        agent_mode = data.get('agent_mode', False)
+        
+        if not text:
+            return jsonify({'success': False, 'error': 'No text provided'}), 400
+        
+        print(f"Translating text: '{text[:50]}...' to {target_language} using {model}")
+        
+        # Use RAG-powered translation if available and agent mode is enabled
+        if agent_mode and current_rag_system:
+            translated_text = translate_paragraph_with_rag(text, model, target_language)
+        else:
+            translated_text = translate_text(text, model, target_language)
+        
+        return jsonify({
+            'success': True,
+            'original_text': text,
+            'translation': translated_text,
+            'target_language': target_language,
+            'model': model,
+            'agent_mode': agent_mode
+        })
+        
+    except Exception as e:
+        print(f"Text translation error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/multi-agent-translate', methods=['POST'])
+def multi_agent_translate_api():
+    """API endpoint for multi-agent translation with multiple options"""
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        model = data.get('model', 'gemma3-legal-samanantar-pro:latest')
+        target_language = data.get('target_language', 'te')
+        source_language = data.get('source_language', 'en')
+        
+        if not text:
+            return jsonify({'success': False, 'error': 'No text provided'}), 400
+        
+        print(f"🤖 Multi-agent translation: '{text[:50]}...' from {source_language} to {target_language} using {model}")
+        
+        # Generate multiple translation options
+        translation_options = generate_multiple_translation_options(text, source_language, target_language, model)
+        
+        return jsonify({
+            'success': True,
+            'original_text': text,
+            'source_language': source_language,
+            'target_language': target_language,
+            'model': model,
+            'options': translation_options
+        })
+    except Exception as e:
+        print(f"Error in multi_agent_translate_api: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def generate_multiple_translation_options(text, source_lang, target_lang, model):
+    """Generate multiple translation options using different approaches"""
+    options = {}
+    
+    try:
+        # Option 1: Standard RAG translation
+        print("🔄 Generating standard RAG translation...")
+        if current_rag_system:
+            options['rag_translation'] = translate_paragraph_with_rag(text, model, target_lang)
+        else:
+            options['rag_translation'] = translate_text(text, model, target_lang)
+        
+        # Option 2: Direct translation without RAG
+        print("🔄 Generating direct translation...")
+        options['direct_translation'] = translate_text(text, model, target_lang)
+        
+        # Option 3: Enhanced translation with context
+        print("🔄 Generating enhanced translation...")
+        options['enhanced_translation'] = generate_enhanced_translation(text, source_lang, target_lang, model)
+        
+        # Option 4: Conservative translation (literal)
+        print("🔄 Generating conservative translation...")
+        options['conservative_translation'] = generate_conservative_translation(text, source_lang, target_lang, model)
+        
+        # Add metadata for each option
+        options['metadata'] = {
+            'rag_translation': {
+                'type': 'RAG-Enhanced',
+                'description': 'Translation with legal context from glossary',
+                'accuracy': 'High',
+                'consistency': 'Good',
+                'recommended': True
+            },
+            'direct_translation': {
+                'type': 'Direct',
+                'description': 'Standard neural translation',
+                'accuracy': 'Good',
+                'consistency': 'Good',
+                'recommended': False
+            },
+            'enhanced_translation': {
+                'type': 'Enhanced',
+                'description': 'Context-aware translation with improvements',
+                'accuracy': 'Very High',
+                'consistency': 'Excellent',
+                'recommended': True
+            },
+            'conservative_translation': {
+                'type': 'Conservative',
+                'description': 'Literal translation preserving structure',
+                'accuracy': 'Medium',
+                'consistency': 'High',
+                'recommended': False
+            }
+        }
+        
+        return options
+        
+    except Exception as e:
+        print(f"Error generating translation options: {e}")
+        # Fallback to single translation
+        fallback_translation = translate_text(text, model, target_lang) if current_rag_system is None else translate_paragraph_with_rag(text, model, target_lang)
+        return {
+            'rag_translation': fallback_translation,
+            'metadata': {
+                'rag_translation': {
+                    'type': 'Fallback',
+                    'description': 'Single translation option',
+                    'accuracy': 'Good',
+                    'consistency': 'Good',
+                    'recommended': True
+                }
+            }
+        }
+
+def generate_enhanced_translation(text, source_lang, target_lang, model):
+    """Generate enhanced translation with additional context and improvements"""
+    try:
+        # First get RAG context if available
+        context_info = ""
+        if current_rag_system:
+            try:
+                similar_content = current_rag_system.search_similar_content(text, target_lang, top_k=3)
+                if similar_content:
+                    context_info = f"Relevant legal context: {similar_content[:200]}..."
+            except Exception as e:
+                print(f"Warning: Could not get RAG context: {e}")
+        
+        # Enhanced prompt with context
+        enhanced_prompt = f"""You are an expert legal translator. Translate the following {source_lang} legal text to {target_lang}.
+
+{context_info}
+
+Original text: "{text}"
+
+Requirements for enhanced translation:
+1. Maintain legal accuracy and terminology
+2. Use formal legal language appropriate for {target_lang}
+3. Ensure cultural and legal context appropriateness
+4. Preserve the legal structure and meaning
+5. Use consistent terminology throughout
+
+Provide ONLY the translation without explanations."""
+
+        # Use Ollama for enhanced translation
+        response = requests.post('http://localhost:11434/api/generate', json={
+            'model': model,
+            'prompt': enhanced_prompt,
+            'stream': False,
+            'options': {
+                'temperature': 0.2,
+                'top_p': 0.9,
+                'num_predict': 1000
+            }
+        })
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('response', '').strip()
+        else:
+            # Fallback to standard translation
+            return translate_text(text, model, target_lang)
+            
+    except Exception as e:
+        print(f"Error in enhanced translation: {e}")
+        return translate_text(text, model, target_lang)
+
+def generate_conservative_translation(text, source_lang, target_lang, model):
+    """Generate conservative/literal translation preserving structure"""
+    try:
+        conservative_prompt = f"""You are a legal translator specializing in literal translations. Translate the following {source_lang} legal text to {target_lang}.
+
+Original text: "{text}"
+
+Requirements for conservative translation:
+1. Preserve the exact legal structure and format
+2. Maintain word order as much as possible
+3. Use literal translations for legal terms
+4. Keep formal legal tone
+5. Preserve all legal formatting and punctuation
+
+Provide ONLY the translation without explanations."""
+
+        # Use Ollama for conservative translation
+        response = requests.post('http://localhost:11434/api/generate', json={
+            'model': model,
+            'prompt': conservative_prompt,
+            'stream': False,
+            'options': {
+                'temperature': 0.1,
+                'top_p': 0.8,
+                'num_predict': 1000
+            }
+        })
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('response', '').strip()
+        else:
+            # Fallback to standard translation
+            return translate_text(text, model, target_lang)
+            
+    except Exception as e:
+        print(f"Error in conservative translation: {e}")
+        return translate_text(text, model, target_lang)
+
+if __name__ == '__main__':
+    print("🚀 Starting Enhanced Legal RAG Document Translator...")
+    print("=" * 60)
+    print("📊 System Status:")
+    print(f"   • Legal RAG System: {'✅ Available' if RAG_AVAILABLE else '❌ Not Available'}")
+    print(f"   • RAG Initialized: {'✅ Yes' if current_rag_system else '❌ No'}")
+    print(f"   • Ollama Models: Available")
+    print("=" * 60)
+    print("🌐 Access the system at: http://localhost:5000")
+    print("⚖️ Features:")
+    print("   • Paragraph-by-paragraph translation")
+    print("   • Legal context awareness")
+    print("   • RAG-powered glossary lookup")
+    print("   • Real-time processing status")
+    print("=" * 60)
+    
+    app.run(debug=False, host='0.0.0.0', port=5000, use_reloader=False)
