@@ -1,0 +1,359 @@
+// Agent Framework with Data Flow Control
+class AgentFramework {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+        this.agents = new Map();
+        this.dataPipeline = [];
+        this.agentStates = new Map();
+        this.initializeAgents();
+    }
+
+    initializeAgents() {
+        // Register all agents with their roles and capabilities
+        this.agents.set('contextAnalyzer', {
+            agent: new ContextAgent(this.ollamaUrl, this.model),
+            role: 'context_analysis',
+            priority: 1,
+            required: true,
+            timeout: 30000
+        });
+
+        this.agents.set('translator', {
+            agent: new TranslationAgent(this.ollamaUrl, this.model),
+            role: 'translation',
+            priority: 2,
+            required: true,
+            timeout: 45000
+        });
+
+        this.agents.set('validator', {
+            agent: new ValidationAgent(this.ollamaUrl, this.model),
+            role: 'validation',
+            priority: 3,
+            required: true,
+            timeout: 30000
+        });
+
+        this.agents.set('qualityAssurance', {
+            agent: new QualityAgent(this.ollamaUrl, this.model),
+            role: 'quality_improvement',
+            priority: 4,
+            required: false,
+            timeout: 45000
+        });
+
+        this.agents.set('languageConsistencyChecker', {
+            agent: new LanguageConsistencyAgent(this.ollamaUrl, this.model),
+            role: 'language_consistency',
+            priority: 5,
+            required: true,
+            timeout: 20000
+        });
+    }
+
+    async executeTranslationPipeline(originalText, sourceLang, targetLang, progressCallback) {
+        console.log('🚀 Starting Agent Framework Pipeline');
+        this.dataPipeline = [];
+        this.agentStates.clear();
+
+        const pipelineData = {
+            originalText,
+            sourceLang,
+            targetLang,
+            context: null,
+            translatedText: null,
+            validation: null,
+            consistencyCheck: null,
+            finalText: null,
+            errors: [],
+            metadata: {
+                startTime: Date.now(),
+                agentResults: {}
+            }
+        };
+
+        try {
+            // Step 1: Context Analysis
+            progressCallback('🔍 Agent 1/5: Context Analysis', 1, 'active');
+            pipelineData.context = await this.executeAgent('contextAnalyzer', {
+                text: originalText,
+                sourceLang,
+                targetLang
+            });
+            pipelineData.metadata.agentResults.contextAnalysis = pipelineData.context;
+            progressCallback('✅ Context Analysis Complete', 1, 'completed');
+
+            // Step 2: Translation
+            progressCallback('🔄 Agent 2/5: Translation', 2, 'active');
+            pipelineData.translatedText = await this.executeAgent('translator', {
+                text: originalText,
+                sourceLang,
+                targetLang,
+                context: pipelineData.context
+            });
+            pipelineData.metadata.agentResults.translation = pipelineData.translatedText;
+            progressCallback('✅ Translation Complete', 2, 'completed');
+
+            // Step 3: Validation
+            progressCallback('✅ Agent 3/5: Validation', 3, 'active');
+            pipelineData.validation = await this.executeAgent('validator', {
+                originalText,
+                translatedText: pipelineData.translatedText,
+                sourceLang,
+                targetLang
+            });
+            pipelineData.metadata.agentResults.validation = pipelineData.validation;
+            progressCallback('✅ Validation Complete', 3, 'completed');
+
+            // Step 4: Language Consistency Check
+            progressCallback('🔍 Agent 4/5: Language Consistency', 4, 'active');
+            pipelineData.consistencyCheck = await this.executeAgent('languageConsistencyChecker', {
+                text: pipelineData.translatedText,
+                targetLang,
+                originalText
+            });
+            pipelineData.metadata.agentResults.consistencyCheck = pipelineData.consistencyCheck;
+            progressCallback('✅ Language Consistency Check Complete', 4, 'completed');
+
+            // Step 5: Quality Improvement (if needed)
+            if (pipelineData.validation.status === 'needs_revision' || 
+                pipelineData.validation.status === 'invalid' ||
+                !pipelineData.consistencyCheck.isConsistent) {
+                
+                progressCallback('🔧 Agent 5/5: Quality Improvement', 5, 'active');
+                pipelineData.finalText = await this.executeAgent('qualityAssurance', {
+                    originalText,
+                    translatedText: pipelineData.translatedText,
+                    sourceLang,
+                    targetLang,
+                    context: pipelineData.context,
+                    validation: pipelineData.validation,
+                    consistencyCheck: pipelineData.consistencyCheck
+                });
+                pipelineData.metadata.agentResults.qualityImprovement = pipelineData.finalText;
+                progressCallback('✅ Quality Improvement Complete', 5, 'completed');
+            } else {
+                pipelineData.finalText = pipelineData.translatedText;
+                progressCallback('✅ Quality Check Passed', 5, 'completed');
+            }
+
+            // Final validation
+            if (pipelineData.finalText !== pipelineData.translatedText) {
+                progressCallback('🔄 Final Validation', 3, 'active');
+                const finalValidation = await this.executeAgent('validator', {
+                    originalText,
+                    translatedText: pipelineData.finalText,
+                    sourceLang,
+                    targetLang
+                });
+                pipelineData.metadata.agentResults.finalValidation = finalValidation;
+                progressCallback('✅ Final Validation Complete', 3, 'completed');
+            }
+
+            pipelineData.metadata.endTime = Date.now();
+            pipelineData.metadata.duration = pipelineData.metadata.endTime - pipelineData.metadata.startTime;
+
+            console.log('🎯 Agent Framework Pipeline Complete:', pipelineData.metadata);
+            return pipelineData.finalText || pipelineData.translatedText;
+
+        } catch (error) {
+            console.error('❌ Agent Framework Pipeline Error:', error);
+            pipelineData.errors.push(error.message);
+            throw error;
+        }
+    }
+
+    async executeAgent(agentName, inputData) {
+        const agentConfig = this.agents.get(agentName);
+        if (!agentConfig) {
+            throw new Error(`Agent ${agentName} not found`);
+        }
+
+        console.log(`🤖 Executing Agent: ${agentName}`, inputData);
+        
+        const startTime = Date.now();
+        this.agentStates.set(agentName, {
+            status: 'running',
+            startTime,
+            inputData
+        });
+
+        try {
+            let result;
+            
+            switch (agentName) {
+                case 'contextAnalyzer':
+                    result = await agentConfig.agent.analyzeContext(
+                        inputData.text, 
+                        inputData.sourceLang, 
+                        inputData.targetLang
+                    );
+                    break;
+                    
+                case 'translator':
+                    result = await agentConfig.agent.translate(
+                        inputData.text, 
+                        inputData.sourceLang, 
+                        inputData.targetLang, 
+                        inputData.context
+                    );
+                    break;
+                    
+                case 'validator':
+                    result = await agentConfig.agent.validateTranslation(
+                        inputData.originalText, 
+                        inputData.translatedText, 
+                        inputData.sourceLang, 
+                        inputData.targetLang
+                    );
+                    break;
+                    
+                case 'qualityAssurance':
+                    result = await agentConfig.agent.improveTranslation(
+                        inputData.originalText, 
+                        inputData.translatedText, 
+                        inputData.sourceLang, 
+                        inputData.targetLang, 
+                        inputData.context
+                    );
+                    break;
+                    
+                case 'languageConsistencyChecker':
+                    result = await agentConfig.agent.checkConsistency(
+                        inputData.text, 
+                        inputData.targetLang, 
+                        inputData.originalText
+                    );
+                    break;
+                    
+                default:
+                    throw new Error(`Unknown agent: ${agentName}`);
+            }
+
+            const endTime = Date.now();
+            this.agentStates.set(agentName, {
+                status: 'completed',
+                startTime,
+                endTime,
+                duration: endTime - startTime,
+                inputData,
+                result
+            });
+
+            console.log(`✅ Agent ${agentName} completed in ${endTime - startTime}ms`);
+            return result;
+
+        } catch (error) {
+            const endTime = Date.now();
+            this.agentStates.set(agentName, {
+                status: 'error',
+                startTime,
+                endTime,
+                duration: endTime - startTime,
+                inputData,
+                error: error.message
+            });
+
+            console.error(`❌ Agent ${agentName} failed:`, error);
+            throw error;
+        }
+    }
+
+    getAgentStates() {
+        return this.agentStates;
+    }
+
+    getPipelineData() {
+        return this.dataPipeline;
+    }
+}
+
+// Enhanced Language Consistency Agent
+class LanguageConsistencyAgent {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+    }
+
+    async checkConsistency(text, targetLang, originalText) {
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        const prompt = `You are a language consistency expert. Analyze the following text for language mixing.
+
+Original text:
+${originalText}
+
+Translated text (should be in ${targetLanguageName}):
+${text}
+
+CRITICAL ANALYSIS REQUIRED:
+1. Check if the translation uses ONLY ${targetLanguageName} language
+2. Identify any words from other languages (English, Telugu, Tamil, Hindi, etc.)
+3. Look for mixed language patterns
+4. Verify consistency in terminology
+
+Respond with a JSON object:
+{
+    "isConsistent": true/false,
+    "mixedWords": ["word1", "word2"],
+    "mixedLanguages": ["language1", "language2"],
+    "consistencyScore": 0-100,
+    "recommendations": ["recommendation1", "recommendation2"]
+}`;
+
+        const result = await this.callOllama(prompt);
+        
+        try {
+            const analysis = JSON.parse(result);
+            return {
+                isConsistent: analysis.isConsistent,
+                mixedWords: analysis.mixedWords || [],
+                mixedLanguages: analysis.mixedLanguages || [],
+                consistencyScore: analysis.consistencyScore || 0,
+                recommendations: analysis.recommendations || [],
+                targetLanguage: targetLanguageName
+            };
+        } catch (error) {
+            // Fallback parsing
+            return {
+                isConsistent: !result.toLowerCase().includes('inconsistent'),
+                mixedWords: [],
+                mixedLanguages: [],
+                consistencyScore: 50,
+                recommendations: ['Manual review recommended'],
+                targetLanguage: targetLanguageName
+            };
+        }
+    }
+
+    getLanguageName(langCode) {
+        const names = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+        return names[langCode] || langCode;
+    }
+
+    async callOllama(prompt) {
+        const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: this.model,
+                prompt: prompt,
+                stream: false,
+                options: { temperature: 0.1, top_p: 0.8, num_predict: 1000 }
+            })
+        });
+        
+        if (!response.ok) throw new Error(`Language consistency agent error: ${response.status}`);
+        const data = await response.json();
+        return data.response.trim();
+    }
+}
