@@ -357,3 +357,862 @@ Respond with a JSON object:
         return data.response.trim();
     }
 }
+
+// AI Agent System for Robust Translation
+class TranslationAgent {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+    }
+
+    async translate(text, sourceLang, targetLang, context = null) {
+        const sourceLanguageName = sourceLang === 'auto' ? 'the detected language' : this.getLanguageName(sourceLang);
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        // Pre-process text to ensure clean input
+        const cleanText = text.trim();
+        
+        let prompt = `TRANSLATE THIS COMPLETE TEXT TO ${targetLanguageName.toUpperCase()}
+
+INPUT TEXT:
+${cleanText}
+
+REQUIREMENTS:
+- Translate the ENTIRE text completely
+- Use ONLY ${targetLanguageName} script
+- NO English letters (a-z, A-Z)
+- NO other language scripts
+- NO explanations or comments
+- PRESERVE the original paragraph structure, line breaks, and spacing
+- Keep the same formatting as the original document
+- Return ONLY the complete translation
+
+COMPLETE ${targetLanguageName.toUpperCase()} TRANSLATION:`;
+
+        const result = await this.callOllama(prompt);
+        
+        // Validate the result immediately with simple character detection
+        const hasTelugu = /[అ-ఱ]/.test(result);
+        const hasEnglish = /[a-zA-Z]/.test(result);
+        const hasTamil = /[அ-ன]/.test(result);
+        const hasHindi = /[अ-ह]/.test(result);
+        
+        // Only flag language mixing if target language is NOT English
+        if (targetLang !== 'en') {
+            if (hasTelugu || hasEnglish || hasTamil || hasHindi) {
+                console.log('❌ Language mixing detected:', {
+                    hasTelugu,
+                    hasEnglish, 
+                    hasTamil,
+                    hasHindi
+                });
+                return await this.retryTranslation(text, sourceLang, targetLang, {hasTelugu, hasEnglish, hasTamil, hasHindi});
+            }
+        }
+        
+        return result;
+    }
+
+    async retryTranslation(text, sourceLang, targetLang, mixingInfo) {
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        let errorMsg = 'You mixed languages! You used: ';
+        if (mixingInfo.hasTelugu) errorMsg += 'Telugu characters, ';
+        if (mixingInfo.hasEnglish) errorMsg += 'English words, ';
+        if (mixingInfo.hasTamil) errorMsg += 'Tamil characters, ';
+        if (mixingInfo.hasHindi) errorMsg += 'Hindi characters, ';
+        
+        const prompt = `FIX THIS TRANSLATION - USE ONLY ${targetLanguageName.toUpperCase()} SCRIPT
+
+ERROR: ${errorMsg}
+
+INPUT TEXT:
+${text}
+
+CORRECT OUTPUT:
+- Use ONLY ${targetLanguageName} script
+- NO English letters (a-z, A-Z)  
+- NO other language scripts
+- NO explanations
+- PRESERVE the original paragraph structure, line breaks, and spacing
+- Keep the same formatting as the original document
+- Return ONLY the translation
+
+${targetLanguageName.toUpperCase()} TRANSLATION:`;
+
+        return await this.callOllama(prompt);
+    }
+
+    getLanguageName(langCode) {
+        const names = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+        return names[langCode] || langCode;
+    }
+
+    async callOllama(prompt) {
+        // Add conversation isolation to prevent LLM memory
+        const isolatedPrompt = `NEW CONVERSATION - IGNORE ALL PREVIOUS CONTEXT
+
+${prompt}`;
+        
+        const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: this.model,
+                prompt: isolatedPrompt,
+                stream: false,
+                options: { 
+                    temperature: 0.1,   // Balanced temperature for consistency
+                    top_p: 0.8,        // Moderate sampling restriction
+                    num_predict: 4000, // Allow longer translations
+                    stop: ["\n\n\n", "---", "Note:", "Explanation:", "Here's the", "The translation", "Translation completed"], // Only stop at clear explanation patterns
+                    repeat_penalty: 1.1, // Moderate penalty for repetition
+                    repeat_last_n: 50,   // Look back fewer tokens
+                    seed: Math.floor(Math.random() * 1000000), // Random seed
+                    top_k: 40,          // Less restrictive vocabulary
+                    tfs_z: 1.0,        // Tail free sampling
+                    typical_p: 0.9     // Typical sampling
+                }
+            })
+        });
+        
+        if (!response.ok) throw new Error(`Translation agent error: ${response.status}`);
+        const data = await response.json();
+        return data.response.trim();
+    }
+}
+
+class ValidationAgent {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+    }
+
+    async validateTranslation(originalText, translatedText, sourceLang, targetLang) {
+        const sourceLanguageName = this.getLanguageName(sourceLang);
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        const prompt = `You are a translation validation expert. Analyze if the translation is accurate and uses ONLY the target language.
+
+Original text (${sourceLanguageName}):
+${originalText}
+
+Translated text (${targetLanguageName}):
+${translatedText}
+
+CRITICAL VALIDATION CRITERIA:
+1. Language Consistency: Does the translation use ONLY ${targetLanguageName}? NO mixing with other languages?
+2. Accuracy: Does it convey the same meaning?
+3. Completeness: Is all content translated?
+4. Fluency: Is it natural in ${targetLanguageName}?
+5. Consistency: Are terms translated consistently?
+
+LANGUAGE CHECK: Look for any words from ${sourceLanguageName} or other languages mixed in the translation.
+
+Respond with:
+- "VALID" if the translation is excellent and uses ONLY ${targetLanguageName}
+- "NEEDS_REVISION" if there are minor issues or language mixing
+- "INVALID" if there are major problems or significant language mixing
+- Brief explanation of any issues found, especially language mixing
+
+Your assessment:`;
+
+        const result = await this.callOllama(prompt);
+        return this.parseValidationResult(result);
+    }
+
+    parseValidationResult(result) {
+        const upperResult = result.toUpperCase();
+        if (upperResult.includes('VALID') && !upperResult.includes('INVALID')) {
+            return { status: 'valid', message: 'Translation validated successfully' };
+        } else if (upperResult.includes('NEEDS_REVISION')) {
+            return { status: 'needs_revision', message: result };
+        } else {
+            return { status: 'invalid', message: result };
+        }
+    }
+
+    getLanguageName(langCode) {
+        const names = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+        return names[langCode] || langCode;
+    }
+
+    async callOllama(prompt) {
+        const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: this.model,
+                prompt: prompt,
+                stream: false,
+                options: { temperature: 0.1, top_p: 0.8, num_predict: 1000 }
+            })
+        });
+        
+        if (!response.ok) throw new Error(`Validation agent error: ${response.status}`);
+        const data = await response.json();
+        return data.response.trim();
+    }
+}
+
+class ContextAgent {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+    }
+
+    async analyzeContext(text, sourceLang, targetLang) {
+        const sourceLanguageName = this.getLanguageName(sourceLang);
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        const prompt = `Analyze the context of this text for translation:
+
+Text (${sourceLanguageName}):
+${text}
+
+Provide context analysis for translating to ${targetLanguageName}:
+1. Document type (legal, technical, literary, etc.)
+2. Tone and formality level
+3. Key terminology that needs special attention
+4. Cultural considerations
+5. Any domain-specific requirements
+
+Keep analysis concise and focused on translation needs.`;
+
+        const result = await this.callOllama(prompt);
+        return {
+            documentType: this.extractDocumentType(result),
+            tone: this.extractTone(result),
+            keyTerms: this.extractKeyTerms(result),
+            culturalNotes: this.extractCulturalNotes(result),
+            fullAnalysis: result
+        };
+    }
+
+    extractDocumentType(analysis) {
+        const lower = analysis.toLowerCase();
+        if (lower.includes('legal')) return 'Legal Document';
+        if (lower.includes('technical')) return 'Technical Document';
+        if (lower.includes('literary')) return 'Literary Text';
+        if (lower.includes('academic')) return 'Academic Text';
+        return 'General Text';
+    }
+
+    extractTone(analysis) {
+        const lower = analysis.toLowerCase();
+        if (lower.includes('formal')) return 'Formal';
+        if (lower.includes('informal')) return 'Informal';
+        return 'Neutral';
+    }
+
+    extractKeyTerms(analysis) {
+        const lines = analysis.split('\n');
+        const terms = [];
+        for (const line of lines) {
+            if (line.includes('terminology') || line.includes('terms')) {
+                terms.push(line.trim());
+            }
+        }
+        return terms;
+    }
+
+    extractCulturalNotes(analysis) {
+        const lines = analysis.split('\n');
+        const notes = [];
+        for (const line of lines) {
+            if (line.includes('cultural') || line.includes('consideration')) {
+                notes.push(line.trim());
+            }
+        }
+        return notes;
+    }
+
+    getLanguageName(langCode) {
+        const names = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+        return names[langCode] || langCode;
+    }
+
+    async callOllama(prompt) {
+        const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: this.model,
+                prompt: prompt,
+                stream: false,
+                options: { temperature: 0.3, top_p: 0.9, num_predict: 800 }
+            })
+        });
+        
+        if (!response.ok) throw new Error(`Context agent error: ${response.status}`);
+        const data = await response.json();
+        return data.response.trim();
+    }
+}
+
+class QualityAgent {
+    constructor(ollamaUrl, model) {
+        this.ollamaUrl = ollamaUrl;
+        this.model = model;
+    }
+
+    async improveTranslation(originalText, translatedText, sourceLang, targetLang, context) {
+        const sourceLanguageName = this.getLanguageName(sourceLang);
+        const targetLanguageName = this.getLanguageName(targetLang);
+        
+        const prompt = `IMPROVE THIS TRANSLATION - FIX LANGUAGE MIXING AND QUALITY ISSUES
+
+Original text (${sourceLanguageName}):
+${originalText}
+
+Current translation (${targetLanguageName}):
+${translatedText}
+
+CRITICAL REQUIREMENTS:
+- Use ONLY ${targetLanguageName} script
+- NO English letters (a-z, A-Z)
+- NO other language scripts mixed in
+- Fix any language mixing issues
+- Improve fluency and naturalness
+- Maintain original meaning and structure
+- NO explanations or comments
+
+IMPROVED ${targetLanguageName.toUpperCase()} TRANSLATION:`;
+
+        const result = await this.callOllama(prompt);
+        
+        // Validate the improved result
+        const hasTelugu = /[అ-ఱ]/.test(result);
+        const hasEnglish = /[a-zA-Z]/.test(result);
+        const hasTamil = /[அ-ன]/.test(result);
+        const hasHindi = /[अ-ह]/.test(result);
+        
+        // Only flag language mixing if target language is NOT English
+        if (targetLang !== 'en') {
+            if (hasTelugu || hasEnglish || hasTamil || hasHindi) {
+                console.log('❌ Quality agent still has language mixing, using original');
+                return translatedText; // Return original if improvement failed
+            }
+        }
+        
+        return result;
+    }
+
+    getLanguageName(langCode) {
+        const names = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+        return names[langCode] || langCode;
+    }
+
+    async callOllama(prompt) {
+        const response = await fetch(`${this.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: this.model,
+                prompt: prompt,
+                stream: false,
+                options: { temperature: 0.1, top_p: 0.8, num_predict: 4000 }
+            })
+        });
+        
+        if (!response.ok) throw new Error(`Quality agent error: ${response.status}`);
+        const data = await response.json();
+        return data.response.trim();
+    }
+}
+
+// Main Document Translator Application
+class DocumentTranslator {
+    constructor() {
+        this.ollamaUrl = 'http://localhost:11434';
+        this.currentModel = 'llama3.1:8b';
+        this.agentFramework = null;
+        this.languageMap = {
+            'en': 'English', 'te': 'Telugu', 'kn': 'Kannada', 'ta': 'Tamil',
+            'hi': 'Hindi', 'bn': 'Bengali', 'gu': 'Gujarati', 'pa': 'Punjabi',
+            'mr': 'Marathi', 'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali',
+            'ur': 'Urdu', 'ml': 'Malayalam', 'si': 'Sinhala', 'my': 'Burmese',
+            'th': 'Thai', 'km': 'Khmer', 'lo': 'Lao', 'vi': 'Vietnamese',
+            'es': 'Spanish', 'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese'
+        };
+    }
+
+    async init() {
+        console.log('🚀 Initializing Document Translator');
+        this.setupEventListeners();
+        
+        // Update status
+        const status = document.getElementById('status');
+        if (status) status.textContent = 'Connecting to Ollama...';
+        
+        const connected = await this.checkOllamaConnection();
+        if (!connected) {
+            if (status) status.textContent = 'Failed to connect to Ollama. Make sure Ollama is running.';
+            return;
+        }
+        
+        if (status) status.textContent = 'Loading models...';
+        await this.loadAvailableModels();
+        
+        this.updateCharacterCount();
+        if (status) status.textContent = 'Ready to translate';
+    }
+
+    setupEventListeners() {
+        // Model selector
+        const modelSelector = document.getElementById('model-selector');
+        if (modelSelector) {
+            modelSelector.addEventListener('change', (e) => {
+                this.updateSelectedModel(e.target.value);
+            });
+        }
+
+        // Source text changes
+        const sourceText = document.getElementById('source-text');
+        if (sourceText) {
+            sourceText.addEventListener('input', () => this.updateCharacterCount());
+        }
+
+        // Translation button
+        const translateBtn = document.getElementById('translate-btn');
+        if (translateBtn) {
+            translateBtn.addEventListener('click', () => this.translateText());
+        }
+
+        // Clear text button
+        const clearBtn = document.getElementById('clear-text');
+        if (clearBtn) {
+            clearBtn.addEventListener('click', () => this.clearText());
+        }
+
+        // Copy button
+        const copyBtn = document.getElementById('copy-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', () => this.copyText());
+        }
+
+        // Download button
+        const downloadBtn = document.getElementById('download-btn');
+        if (downloadBtn) {
+            downloadBtn.addEventListener('click', () => this.downloadText());
+        }
+
+        // Upload button
+        const uploadBtn = document.getElementById('upload-btn');
+        if (uploadBtn) {
+            uploadBtn.addEventListener('click', () => this.uploadFile());
+        }
+
+        // File input
+        const fileInput = document.getElementById('file-input');
+        if (fileInput) {
+            fileInput.addEventListener('change', (e) => this.handleFileUpload(e));
+        }
+
+        // Swap languages button
+        const swapBtn = document.getElementById('swap-languages');
+        if (swapBtn) {
+            swapBtn.addEventListener('click', () => this.swapLanguages());
+        }
+    }
+
+    async checkOllamaConnection() {
+        try {
+            console.log('🔍 Checking Ollama connection at:', this.ollamaUrl);
+            const response = await fetch(`${this.ollamaUrl}/api/tags`);
+            console.log('📡 Connection response status:', response.status);
+            
+            if (response.ok) {
+                console.log('✅ Ollama connection successful');
+                return true;
+            } else {
+                console.error('❌ Ollama connection failed - Status:', response.status);
+                return false;
+            }
+        } catch (error) {
+            console.error('❌ Ollama connection error:', error);
+            console.error('💡 Make sure Ollama is running: ollama serve');
+            return false;
+        }
+    }
+
+    async loadAvailableModels() {
+        try {
+            console.log('🔄 Attempting to load models from:', this.ollamaUrl);
+            const response = await fetch(`${this.ollamaUrl}/api/tags`);
+            console.log('📡 Response status:', response.status);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const data = await response.json();
+            console.log('📊 Raw API response:', data);
+            const models = data.models || [];
+            console.log('🤖 Models found:', models);
+            
+            const modelSelector = document.getElementById('model-selector');
+            if (modelSelector) {
+                modelSelector.innerHTML = '';
+                
+                if (models.length === 0) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'No models found - Please install models in Ollama';
+                    option.disabled = true;
+                    modelSelector.appendChild(option);
+                } else {
+                    models.forEach(model => {
+                        const option = document.createElement('option');
+                        option.value = model.name;
+                        option.textContent = model.name;
+                        if (model.name === this.currentModel) {
+                            option.selected = true;
+                        }
+                        modelSelector.appendChild(option);
+                    });
+                }
+            }
+            
+            console.log(`📋 Successfully loaded ${models.length} models`);
+        } catch (error) {
+            console.error('❌ Error loading models:', error);
+            
+            // Update UI to show error
+            const modelSelector = document.getElementById('model-selector');
+            if (modelSelector) {
+                modelSelector.innerHTML = '';
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = `Error: ${error.message}`;
+                option.disabled = true;
+                modelSelector.appendChild(option);
+            }
+        }
+    }
+
+    updateSelectedModel(modelName) {
+        this.currentModel = modelName;
+        this.agentFramework = new AgentFramework(this.ollamaUrl, modelName);
+        console.log(`🔄 Switched to model: ${modelName}`);
+    }
+
+    updateCharacterCount() {
+        const sourceText = document.getElementById('source-text');
+        const charCount = document.getElementById('char-count');
+        if (sourceText && charCount) {
+            charCount.textContent = sourceText.value.length;
+        }
+    }
+
+    async translateText() {
+        const sourceText = document.getElementById('source-text');
+        const targetText = document.getElementById('target-text');
+        const status = document.getElementById('status');
+        const translateBtn = document.getElementById('translate-btn');
+        
+        if (!sourceText || !targetText || !status || !translateBtn) {
+            console.error('Required elements not found');
+            return;
+        }
+
+        const text = sourceText.value.trim();
+        if (!text) {
+            status.textContent = 'Please enter text to translate';
+            return;
+        }
+
+        const sourceLang = document.getElementById('source-lang').value;
+        const targetLang = document.getElementById('target-lang').value;
+
+        if (sourceLang === targetLang) {
+            status.textContent = 'Source and target languages cannot be the same';
+            return;
+        }
+
+        // Disable button and show status
+        translateBtn.disabled = true;
+        translateBtn.textContent = 'Translating...';
+        status.textContent = 'Translating...';
+
+        try {
+            // Initialize agent framework if not already done
+            if (!this.agentFramework) {
+                this.agentFramework = new AgentFramework(this.ollamaUrl, this.currentModel);
+            }
+
+            // Show agent status
+            const agentStatus = document.getElementById('agent-status');
+            if (agentStatus) {
+                agentStatus.style.display = 'block';
+            }
+
+            // Progress callback
+            const progressCallback = (message, step, stepStatus) => {
+                console.log(`Agent ${step}: ${message}`);
+                const stepElement = document.getElementById(`step-${step}`);
+                if (stepElement) {
+                    stepElement.className = `agent-step ${stepStatus}`;
+                }
+                const statusElement = document.getElementById('status');
+                if (statusElement) {
+                    statusElement.textContent = message;
+                }
+            };
+
+            // Perform translation using agent framework
+            const translatedText = await this.agentFramework.executeTranslationPipeline(
+                text, 
+                sourceLang, 
+                targetLang, 
+                progressCallback
+            );
+
+            // Update target text
+            targetText.value = translatedText;
+            status.textContent = 'Translation completed successfully!';
+
+            // Hide agent status
+            if (agentStatus) {
+                agentStatus.style.display = 'none';
+            }
+
+        } catch (error) {
+            console.error('Translation error:', error);
+            status.textContent = `Translation failed: ${error.message}`;
+            targetText.value = '';
+        } finally {
+            // Re-enable button
+            translateBtn.disabled = false;
+            translateBtn.textContent = 'Translate';
+        }
+    }
+
+    clearText() {
+        const sourceText = document.getElementById('source-text');
+        const targetText = document.getElementById('target-text');
+        const status = document.getElementById('status');
+        
+        if (sourceText) sourceText.value = '';
+        if (targetText) targetText.value = '';
+        if (status) status.textContent = 'Ready to translate';
+        
+        this.updateCharacterCount();
+    }
+
+    async copyText() {
+        const targetText = document.getElementById('target-text');
+        if (!targetText || !targetText.value) {
+            return;
+        }
+
+        try {
+            await navigator.clipboard.writeText(targetText.value);
+            const status = document.getElementById('status');
+            if (status) {
+                status.textContent = 'Text copied to clipboard!';
+                setTimeout(() => {
+                    status.textContent = 'Ready to translate';
+                }, 2000);
+            }
+        } catch (error) {
+            console.error('Copy failed:', error);
+        }
+    }
+
+    downloadText() {
+        const targetText = document.getElementById('target-text');
+        const format = document.getElementById('download-format').value;
+        
+        if (!targetText || !targetText.value) {
+            return;
+        }
+
+        if (format === 'txt') {
+            this.downloadAsText(targetText.value);
+        } else if (format === 'pdf') {
+            this.downloadAsPDF(targetText.value);
+        }
+    }
+
+    downloadAsText(text) {
+        const blob = new Blob([text], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'translation.txt';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    downloadAsPDF(text) {
+        // Simple PDF generation using jsPDF
+        if (typeof window.jsPDF !== 'undefined') {
+            const doc = new window.jsPDF();
+            const lines = doc.splitTextToSize(text, 180);
+            doc.text(lines, 10, 10);
+            doc.save('translation.pdf');
+        } else {
+            console.error('jsPDF not available');
+        }
+    }
+
+    uploadFile() {
+        const fileInput = document.getElementById('file-input');
+        if (fileInput) {
+            fileInput.click();
+        }
+    }
+
+    swapLanguages() {
+        const sourceLang = document.getElementById('source-lang');
+        const targetLang = document.getElementById('target-lang');
+        
+        if (sourceLang && targetLang) {
+            const temp = sourceLang.value;
+            sourceLang.value = targetLang.value;
+            targetLang.value = temp;
+        }
+    }
+
+    async handleFileUpload(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const fileName = document.getElementById('file-name');
+        if (fileName) {
+            fileName.textContent = file.name;
+        }
+
+        const sourceText = document.getElementById('source-text');
+        if (!sourceText) return;
+
+        try {
+            let text = '';
+            
+            if (file.type === 'text/plain') {
+                text = await this.readTextFile(file);
+            } else if (file.type === 'application/pdf') {
+                text = await this.readPDFFile(file);
+            } else if (file.type.includes('word') || file.name.endsWith('.docx')) {
+                text = await this.readWordFile(file);
+            } else {
+                throw new Error('Unsupported file type');
+            }
+
+            sourceText.value = text;
+            this.updateCharacterCount();
+            
+            const status = document.getElementById('status');
+            if (status) {
+                status.textContent = `File "${file.name}" loaded successfully`;
+            }
+
+        } catch (error) {
+            console.error('File upload error:', error);
+            const status = document.getElementById('status');
+            if (status) {
+                status.textContent = `Error loading file: ${error.message}`;
+            }
+        }
+    }
+
+    readTextFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.onerror = (e) => reject(new Error('Failed to read file'));
+            reader.readAsText(file);
+        });
+    }
+
+    readPDFFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    // Simple PDF text extraction (basic implementation)
+                    const arrayBuffer = e.target.result;
+                    const text = await this.extractTextFromPDF(arrayBuffer);
+                    resolve(text);
+                } catch (error) {
+                    reject(new Error('Failed to extract text from PDF'));
+                }
+            };
+            reader.onerror = (e) => reject(new Error('Failed to read PDF file'));
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    async extractTextFromPDF(arrayBuffer) {
+        // Basic PDF text extraction - in a real implementation, you'd use a PDF library
+        // For now, return a placeholder message
+        return 'PDF text extraction not fully implemented. Please copy and paste the text manually.';
+    }
+
+    readWordFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    // Basic Word document text extraction
+                    const arrayBuffer = e.target.result;
+                    const text = await this.extractTextFromWord(arrayBuffer);
+                    resolve(text);
+                } catch (error) {
+                    reject(new Error('Failed to extract text from Word document'));
+                }
+            };
+            reader.onerror = (e) => reject(new Error('Failed to read Word file'));
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    async extractTextFromWord(arrayBuffer) {
+        // Basic Word document text extraction - in a real implementation, you'd use a Word library
+        // For now, return a placeholder message
+        return 'Word document text extraction not fully implemented. Please copy and paste the text manually.';
+    }
+
+}
+
+// Initialize the application
+document.addEventListener('DOMContentLoaded', () => {
+    const translator = new DocumentTranslator();
+    translator.init();
+});
